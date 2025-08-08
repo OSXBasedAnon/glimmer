@@ -6,7 +6,7 @@
 
 ## Technical Features
 
-* **Intelligent Conversational State Management:** The `cli::chat::handle_chat` function maintains a persistent conversation state, enabling multi-turn, contextual interactions. The system synthesizes prior messages with new prompts to maintain a coherent dialogue and provide highly-relevant responses.
+* **Intelligent Conversational State Management:** A persistent conversation state, enabling multi-turn, contextual interactions. The system synthesizes prior messages with new prompts to maintain a coherent dialogue and provide highly-relevant responses.
 
 * **Adaptive Task Analysis and Decomposition:** Glimmer's core intelligence is driven by analyzing task complexity and using adaptive metrics to form deep responses related to the query. This function dynamically assesses the complexity of a user's request and generates a structured `TaskComplexity` object. This object informs the execution strategy and, for complex tasks, provides a pre-computed vector of sub-steps.
 
@@ -108,6 +108,7 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
 
 
