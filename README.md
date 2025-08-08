@@ -1,3 +1,5 @@
+![0](https://github.com/user-attachments/assets/7810225d-7f83-4255-b71a-2c83fac79ddd)
+
 # Glimmer: A High-Performance AI Assistant CLI
 
 `Glimmer` is a modular, high-performance command-line interface (CLI) built entirely in Rust. It serves as a powerful and responsive AI assistant for developers, integrating directly with the Gemini Protocol to handle a diverse range of coding tasks, from atomic file edits to multi-step architectural refactoring.
@@ -105,3 +107,4 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
