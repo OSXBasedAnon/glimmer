@@ -72,7 +72,9 @@ For security, it is highly recommended to set your Gemini API key as an environm
 GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
 ```
 
-And ensure you are loading this file in your application at startup.
+And ensure you are loading this file in your application at startup. https://aistudio.google.com/
+
+You can sign in there with your Google Account to get an API key for the free tier of the Gemini API.
 
 ---
 
@@ -108,6 +110,7 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
 
 
