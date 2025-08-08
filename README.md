@@ -66,18 +66,13 @@ cargo build --release
 
 ### Configuration
 
-For security, it is highly recommended to set your Gemini API key as an environment variable.
+For security, it is highly recommended to set your Gemini API key as an environment variable. Create a `.env` file in your project root with the following content:
 
-```bash
-export GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+```
+GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
 ```
 
-Alternatively, for local development, you can create a `config.toml` file in your project root with the following content:
-
-```toml
-[gemini]
-api_key = "YOUR_GEMINI_API_KEY"
-```
+And ensure you are loading this file in your application at startup.
 
 ---
 
