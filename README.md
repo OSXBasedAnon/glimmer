@@ -66,7 +66,13 @@ cargo build --release
 
 ### Configuration
 
-Glimmer requires a Gemini API key. Create a `config.toml` file in your project root with the following content:
+For security, it is highly recommended to set your Gemini API key as an environment variable.
+
+```bash
+export GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+```
+
+Alternatively, for local development, you can create a `config.toml` file in your project root with the following content:
 
 ```toml
 [gemini]
@@ -107,4 +113,5 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
