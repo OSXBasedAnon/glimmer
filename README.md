@@ -10,7 +10,7 @@
 
 * **Adaptive Task Analysis and Decomposition:** Glimmer's core intelligence is driven by analyzing task complexity and using adaptive metrics to form deep responses related to the query. This function dynamically assesses the complexity of a user's request and generates a structured `TaskComplexity` object. This object informs the execution strategy and, for complex tasks, provides a pre-computed vector of sub-steps.
 
-    * **Low-Complexity Execution:** Trivial tasks are handled via a single, optimized API call using `gemini::query_gemini` to minimize latency and token consumption.
+    * **Low-Complexity Execution:** Trivial tasks are handled via a single, optimized API call using Gemini to minimize latency and token consumption.
 
     * **High-Complexity Orchestration:** For tasks requiring a multi-step approach, the system autonomously iterates through the pre-planned steps, executing each as an independent prompt-response loop. Intermediate results are cached and fed back into subsequent steps for enhanced context.
 
@@ -108,6 +108,7 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
 
 
