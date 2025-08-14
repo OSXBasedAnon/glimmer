@@ -54,7 +54,7 @@ Glimmer's architecture is a modular pipeline for intelligent task execution. The
 
 ```bash
 # Clone the Glimmer repository
-git clone [https://github.com/OSXBasedAnon/glimmer.git](https://github.com/OSXBasedAnon/glimmer.git)
+git clone https://github.com/OSXBasedAnon/glimmer.git
 cd glimmer
 
 # Build the project in release mode for optimal performance
@@ -112,6 +112,7 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
 
 
