@@ -19,7 +19,6 @@ mod progress_display;
 mod thinking_display;
 mod reasoning_engine;
 mod input_handler;
-mod realtime_display;
 
 use cli::colors::*;
 
@@ -234,8 +233,8 @@ async fn main() -> Result<()> {
     let config = config::load_config(cli.config.as_deref()).await?;
     info!("Configuration loaded successfully");
 
-    // Initialize realtime display for Claude Code-style output
-    realtime_display::init_realtime_display();
+    // Initialize modern realtime UI for Claude Code-style output
+    progress_display::init_realtime_ui();
 
     // Execute command or start interactive chat if no command provided
     match cli.command {

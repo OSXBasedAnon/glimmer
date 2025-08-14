@@ -149,7 +149,8 @@ impl MemoryEngine {
                     db_clone, working_tree_clone, background_tree_clone, 
                     config_clone, metadata_tree_clone, last_move_clone, count_clone
                 ).await {
-                    eprintln!("Background compaction failed: {}", e);
+                    // Background compaction failed - log to status bar instead
+                    crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("Background compaction failed: {}", e));
                 }
             });
         }
@@ -631,7 +632,6 @@ impl MemoryEngine {
         last_background_move: Arc<Mutex<DateTime<Utc>>>,
         message_count: Arc<AtomicU64>,
     ) -> Result<()> {
-        use crate::cli::colors::{EMERALD_BRIGHT, GRAY_DIM, RESET};
         
         let count = message_count.load(Ordering::Relaxed);
         let reason = if count >= FORCE_COMPACTION_LIMIT {
@@ -640,8 +640,8 @@ impl MemoryEngine {
             "optimizing for better performance"
         };
         
-        println!("{}🗜️  Background compacting conversation memory ({} messages): {}{}", 
-            EMERALD_BRIGHT, count, reason, RESET);
+        // Show compaction progress in status bar instead of direct print
+        crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("🗜️ Background compacting conversation memory ({} messages): {}", count, reason));
         
         // Get all messages
         let all_messages: Vec<ChatMessage> = working_memory_tree.iter()
@@ -650,7 +650,8 @@ impl MemoryEngine {
             .collect();
         
         if all_messages.len() <= WORKING_CONTEXT_TRUNCATED {
-            println!("{}Memory already optimal, skipping compaction{}", GRAY_DIM, RESET);
+            // Memory optimal - show in status bar
+            crate::thinking_display::PersistentStatusBar::set_ai_thinking("Memory already optimal, skipping compaction");
             return Ok(());
         }
         
@@ -712,7 +713,8 @@ impl MemoryEngine {
         // Flush database
         db.flush_async().await?;
         
-        println!("{}🗜️ Background compaction completed{}", EMERALD_BRIGHT, RESET);
+        // Compaction completed - show in status bar
+        crate::thinking_display::PersistentStatusBar::set_ai_thinking("🗜️ Background compaction completed");
         
         Ok(())
     }
@@ -770,6 +772,148 @@ impl MemoryEngine {
             let percentage = (message_count * 50) / COMPACTION_THRESHOLD;
             percentage.min(50) as u8
         }
+    }
+    
+    /// Smart context retrieval for current task - leverages metadata for better reasoning
+    pub async fn get_smart_context_for_task(&self, current_request: &str) -> Result<String> {
+        let mut context_parts = Vec::new();
+        
+        // Get recent messages with rich metadata
+        let recent_messages = self.get_recent_messages(10).await?;
+        
+        // Extract file-related context if current request involves files
+        if current_request.to_lowercase().contains("file") || current_request.contains(".") {
+            let file_context = self.extract_file_context(&recent_messages, current_request);
+            if !file_context.is_empty() {
+                context_parts.push(format!("RECENT FILE OPERATIONS:\n{}", file_context));
+            }
+        }
+        
+        // Extract error context for debugging tasks
+        if current_request.to_lowercase().contains("fix") || current_request.to_lowercase().contains("error") {
+            let error_context = self.extract_error_context(&recent_messages);
+            if !error_context.is_empty() {
+                context_parts.push(format!("RECENT ERRORS/ISSUES:\n{}", error_context));
+            }
+        }
+        
+        // Extract success patterns for similar tasks
+        let success_context = self.extract_success_patterns(&recent_messages, current_request);
+        if !success_context.is_empty() {
+            context_parts.push(format!("SUCCESSFUL APPROACHES:\n{}", success_context));
+        }
+        
+        // Standard conversation context (condensed)
+        let conversation_context = recent_messages.iter()
+            .take(5)
+            .map(|msg| format!("{}: {}", msg.role, self.truncate_message_content(&msg.content)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        if !conversation_context.is_empty() {
+            context_parts.push(format!("RECENT CONVERSATION:\n{}", conversation_context));
+        }
+        
+        Ok(context_parts.join("\n\n"))
+    }
+    
+    /// Extract file-related context from message metadata
+    fn extract_file_context(&self, messages: &[ChatMessage], current_request: &str) -> String {
+        let mut file_operations = Vec::new();
+        
+        for msg in messages.iter().rev().take(5) {
+            if !msg.metadata.files_mentioned.is_empty() {
+                let files_str = msg.metadata.files_mentioned.join(", ");
+                if msg.metadata.success_indicator {
+                    file_operations.push(format!("✓ Worked on: {}", files_str));
+                } else {
+                    file_operations.push(format!("⚠ Attempted: {}", files_str));
+                }
+            }
+            
+            if !msg.metadata.code_changes.is_empty() {
+                let changes_str = msg.metadata.code_changes.join(", ");
+                file_operations.push(format!("📝 Changes: {}", changes_str));
+            }
+        }
+        
+        // Find mentioned files in current request
+        let request_lower = current_request.to_lowercase();
+        for msg in messages {
+            for file in &msg.metadata.files_mentioned {
+                if request_lower.contains(&file.to_lowercase()) || current_request.contains(file) {
+                    file_operations.push(format!("🎯 Previously worked on: {}", file));
+                    break;
+                }
+            }
+        }
+        
+        file_operations.join("\n")
+    }
+    
+    /// Extract error context for debugging assistance
+    fn extract_error_context(&self, messages: &[ChatMessage]) -> String {
+        let mut error_info = Vec::new();
+        
+        for msg in messages.iter().rev().take(8) {
+            if let Some(error_type) = &msg.metadata.error_type {
+                error_info.push(format!("⚠ {}: {}", error_type, 
+                    msg.content.lines().next().unwrap_or("").chars().take(100).collect::<String>()));
+            }
+            
+            if msg.content.to_lowercase().contains("error") || msg.content.to_lowercase().contains("failed") {
+                let error_line = msg.content.lines()
+                    .find(|line| line.to_lowercase().contains("error") || line.to_lowercase().contains("failed"))
+                    .unwrap_or("")
+                    .chars().take(150).collect::<String>();
+                if !error_line.is_empty() {
+                    error_info.push(format!("❌ {}", error_line));
+                }
+            }
+        }
+        
+        error_info.join("\n")
+    }
+    
+    /// Extract successful patterns for similar task types
+    fn extract_success_patterns(&self, messages: &[ChatMessage], current_request: &str) -> String {
+        let mut success_patterns = Vec::new();
+        let request_lower = current_request.to_lowercase();
+        
+        // Categorize current request
+        let task_category = if request_lower.contains("edit") || request_lower.contains("modify") {
+            "editing"
+        } else if request_lower.contains("create") || request_lower.contains("build") {
+            "creation"
+        } else if request_lower.contains("fix") || request_lower.contains("debug") {
+            "debugging"
+        } else if request_lower.contains("analyze") || request_lower.contains("explain") {
+            "analysis"
+        } else {
+            "general"
+        };
+        
+        for msg in messages.iter().rev().take(10) {
+            if msg.metadata.success_indicator {
+                let content_lower = msg.content.to_lowercase();
+                let matches_category = match task_category {
+                    "editing" => content_lower.contains("edit") || content_lower.contains("modif"),
+                    "creation" => content_lower.contains("creat") || content_lower.contains("build"),
+                    "debugging" => content_lower.contains("fix") || content_lower.contains("debug"),
+                    "analysis" => content_lower.contains("analyz") || content_lower.contains("explain"),
+                    _ => true,
+                };
+                
+                if matches_category {
+                    if let Some(task_type) = &msg.metadata.task_type {
+                        success_patterns.push(format!("✓ {}: {}", task_type, 
+                            msg.content.lines().next().unwrap_or("").chars().take(120).collect::<String>()));
+                    }
+                }
+            }
+        }
+        
+        success_patterns.join("\n")
     }
 }
 

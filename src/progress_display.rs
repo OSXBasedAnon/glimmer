@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use std::sync::Mutex;
+use std::collections::VecDeque;
 use crate::cli::colors::*;
 
 /// Advanced progress display system inspired by Cargo and Claude Code
@@ -114,10 +116,10 @@ impl ProgressDisplay {
     }
 
     /// Display a simple loading bar for file operations
-    pub async fn show_file_progress(&self, file_name: &str, progress: f32) -> Result<()> {
+    pub async fn show_file_progress(&self, _file_name: &str, progress: f32) -> Result<()> {
         let bar_width = 40;
         let filled = (progress * bar_width as f32) as usize;
-        let empty = bar_width - filled;
+        let _empty = bar_width - filled;
         
         // Skip file progress display and flush in ratatui mode
         
@@ -135,8 +137,8 @@ impl ProgressDisplay {
             // Skip print in ratatui mode: print!("\x1B[F\x1B[K"); // Move up and clear line
         }
         
-        for (i, line) in status_lines.iter().enumerate() {
-            let prefix = if i == status_lines.len() - 1 {
+        for (i, _line) in status_lines.iter().enumerate() {
+            let _prefix = if i == status_lines.len() - 1 {
                 format!("{}{}", BLUE_BRIGHT, "⠋") // Active spinner for current line
             } else {
                 format!("{}{}", EMERALD_BRIGHT, "✓") // Check mark for completed
@@ -172,7 +174,7 @@ impl ProgressHandle {
         // Task will clean up the display automatically
     }
 
-    pub fn finish_with_message(self, message: &str) {
+    pub fn finish_with_message(self, _message: &str) {
         self.is_active.store(false, Ordering::Relaxed);
         
         // Wait a moment for cleanup, then show completion message
@@ -224,4 +226,205 @@ where
     }
     
     result
+}
+
+/// Perfect Claude Code / Gemini CLI style real-time UI for chat integration
+pub struct RealtimeUI {
+    operations: Arc<Mutex<VecDeque<Operation>>>,
+    output_lines: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone)]
+struct Operation {
+    id: String,
+    operation_type: OperationType,
+    status: OperationStatus,
+    token_info: Option<String>,
+    result: Option<String>,
+}
+
+#[derive(Clone)]
+enum OperationType {
+    Analyzing,
+    Editing,
+    Reading,
+    Listing,
+    TaskComplete,
+}
+
+#[derive(Clone, PartialEq)]
+enum OperationStatus {
+    InProgress,
+    Completed,
+}
+
+impl RealtimeUI {
+    pub fn new() -> Self {
+        Self {
+            operations: Arc::new(Mutex::new(VecDeque::new())),
+            output_lines: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Start an operation with real-time display
+    pub fn start_operation(&self, operation_id: &str, op_type: OperationType, token_info: Option<&str>) {
+        let operation = Operation {
+            id: operation_id.to_string(),
+            operation_type: op_type.clone(),
+            status: OperationStatus::InProgress,
+            token_info: token_info.map(|s| s.to_string()),
+            result: None,
+        };
+
+        // Display immediately
+        let (_color, name) = match op_type {
+            OperationType::Analyzing => (YELLOW_ANALYZE, "Analyzing code"),
+            OperationType::Editing => (ORANGE_EDIT, "Editing code"),
+            OperationType::Reading => (WHITE_BRIGHT, "Read"),
+            OperationType::Listing => (WHITE_BRIGHT, "List"),
+            OperationType::TaskComplete => (GREEN_COMPLETE, "Task completed"),
+        };
+
+        // Send colored text to reasoning steps with proper ratatui color information
+        let text = if let Some(tokens) = &operation.token_info {
+            format!(" {} ({})", name, tokens)
+        } else {
+            format!(" {}", name)
+        };
+        
+        // Extract RGB values from the color and send to colored reasoning step
+        let rgb_color = match op_type {
+            OperationType::Analyzing => (255, 204, 92),   // #ffcc5c yellow
+            OperationType::Editing => (255, 175, 0),      // #ffaf00 orange  
+            OperationType::Reading => (255, 255, 255),    // white
+            OperationType::Listing => (255, 255, 255),    // white
+            OperationType::TaskComplete => (159, 239, 0), // #9fef00 green
+        };
+        
+        // Add to reasoning steps for immediate chat display
+        crate::thinking_display::PersistentStatusBar::add_colored_reasoning_step(rgb_color, &text);
+
+        // Store operation
+        if let Ok(mut ops) = self.operations.lock() {
+            ops.push_back(operation);
+            // Keep only last 10 operations for memory
+            if ops.len() > 10 {
+                ops.pop_front();
+            }
+        }
+    }
+
+    /// Complete an operation
+    pub fn complete_operation(&self, operation_id: &str, result: &str) {
+        // Update the operation
+        if let Ok(mut ops) = self.operations.lock() {
+            if let Some(op) = ops.iter_mut().find(|o| o.id == operation_id) {
+                op.status = OperationStatus::Completed;
+                op.result = Some(result.to_string());
+            }
+        }
+
+        // Send completion directly to chat
+        let completion_line = format!("  ⎿ {}", result);
+        crate::thinking_display::PersistentStatusBar::add_reasoning_step(&completion_line);
+    }
+
+    /// Show task completion (final green bullet)
+    pub fn show_task_completion(&self, summary: &str) {
+        // Send green colored task completion indicator
+        crate::thinking_display::PersistentStatusBar::add_colored_reasoning_step((159, 239, 0), " Task completed");
+        let summary_line = format!("  ⎿ {}", summary);
+        
+        // Send directly to chat
+        crate::thinking_display::PersistentStatusBar::add_reasoning_step(&summary_line);
+    }
+    
+    /// Get new output lines for chat integration
+    pub fn get_new_lines(&self) -> Vec<String> {
+        if let Ok(mut lines) = self.output_lines.lock() {
+            let new_lines = lines.clone();
+            lines.clear();
+            new_lines
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Clear all operations
+    pub fn clear(&self) {
+        if let Ok(mut ops) = self.operations.lock() {
+            ops.clear();
+        }
+    }
+}
+
+/// Global UI instance
+static mut REALTIME_UI: Option<RealtimeUI> = None;
+static mut INITIALIZED: bool = false;
+
+pub fn init_realtime_ui() {
+    unsafe {
+        if !INITIALIZED {
+            REALTIME_UI = Some(RealtimeUI::new());
+            INITIALIZED = true;
+        }
+    }
+}
+
+fn get_ui() -> &'static RealtimeUI {
+    unsafe {
+        if !INITIALIZED {
+            init_realtime_ui();
+        }
+        REALTIME_UI.as_ref().unwrap()
+    }
+}
+
+/// Public API functions that match your exact requirements
+
+/// Start analyzing with token count display
+pub fn start_analyzing(token_count: u32) -> String {
+    let operation_id = format!("analyze_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    let token_info = format!("{}→0", token_count);
+    get_ui().start_operation(&operation_id, OperationType::Analyzing, Some(&token_info));
+    operation_id
+}
+
+/// Start editing with token count display  
+pub fn start_editing(token_count: u32) -> String {
+    let operation_id = format!("edit_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    let token_info = format!("{}→0", token_count);
+    get_ui().start_operation(&operation_id, OperationType::Editing, Some(&token_info));
+    operation_id
+}
+
+/// Complete any operation
+pub fn complete_operation(operation_id: &str, result: &str) {
+    get_ui().complete_operation(operation_id, result);
+}
+
+/// Show final task completion
+pub fn task_completed(summary: &str) {
+    get_ui().show_task_completion(summary);
+}
+
+/// Clear all operations (for clean slate)
+pub fn clear_operations() {
+    get_ui().clear();
+}
+
+/// Get new real-time UI lines for chat integration
+pub fn get_new_ui_lines() -> Vec<String> {
+    get_ui().get_new_lines()
+}
+
+/// Convenience functions for quick operations
+pub fn quick_analyze_complete(token_count: u32, result: &str) {
+    let id = start_analyzing(token_count);
+    complete_operation(&id, result);
+}
+
+pub fn quick_edit_complete(token_count: u32, result: &str) {
+    let id = start_editing(token_count);
+    complete_operation(&id, result);
 }

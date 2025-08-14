@@ -22,7 +22,7 @@ pub async fn handle_edit(
     };
 
     // Use the main, robust editing logic. The conversation history is empty for direct CLI calls.
-    match crate::function_calling::execute_edit_code_with_path_and_query(&function_call, config, "").await {
+    match crate::function_calling::execute_function_call(&function_call, config, "").await {
         Ok(summary) => {
             crate::emerald_println!("{}", summary);
             Ok(())

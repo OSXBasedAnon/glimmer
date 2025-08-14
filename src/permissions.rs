@@ -104,18 +104,14 @@ impl PermissionManager {
         })
     }
 
-    async fn prompt_for_approval(&self, path: &Path) -> Result<bool> {
-        // For now, auto-approve the glimmer directory to prevent terminal conflicts
-        // TODO: Implement proper ratatui-compatible permission dialog
-        if path.to_string_lossy().contains("glimmer") {
-            emerald_println!("\n✅ Auto-approved access to glimmer directory: {}", path.display());
-            return Ok(true);
-        }
-        
-        // For other paths, use a simple approval mechanism
-        emerald_println!("\n🔒 Permission Request:");
-        emerald_println!("Glimmer needs access to: {}", path.display());
-        emerald_println!("Auto-approving for now to prevent terminal conflicts.");
+    async fn prompt_for_approval(&self, _path: &Path) -> Result<bool> {
+        // In ratatui mode, direct terminal interaction is not possible here.
+        // The permission request should be handled by the main UI loop.
+        // For now, we will auto-approve to prevent terminal corruption from println!,
+        // but we will not print any confirmation message here. The confirmation
+        // should be surfaced to the UI to be displayed correctly.
+        // The original logic was to auto-approve anyway to prevent conflicts.
+        // We will maintain that behavior but make it silent.
         
         Ok(true)
     }
@@ -123,7 +119,9 @@ impl PermissionManager {
     async fn add_allowed_path(&mut self, path: PathBuf) -> Result<()> {
         self.config.allowed_paths.insert(path.clone());
         self.save_config().await?;
-        emerald_println!("Added to allowed paths: {}", path.display());
+        // This println also corrupts the UI. It should be removed.
+        // The confirmation should be returned to the caller to display in the TUI.
+        // For now, the successful operation is implicit confirmation.
         Ok(())
     }
 

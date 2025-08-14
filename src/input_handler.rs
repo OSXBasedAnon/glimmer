@@ -76,8 +76,8 @@ impl InputHandler {
         let mut cursor_pos = 0;
 
         loop {
-            // Check for events with timeout to allow for interrupts
-            if event::poll(Duration::from_millis(100))? {
+            // Check for events with timeout to allow for interrupts (reduced polling frequency)
+            if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key_event) => {
                         match self.handle_key_event(key_event, &mut input_buffer, &mut cursor_pos).await? {
@@ -127,13 +127,11 @@ impl InputHandler {
                 return Ok(Some(InputResult::Interrupted));
             }
 
-            // Handle Ctrl+C
+            // Ctrl+C is handled by terminal for copying - don't intercept it
+            // Use Ctrl+D or ESC for interruption instead
             KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                println!("\n{}🛑 Operation interrupted by Ctrl+C{}", EMERALD_BRIGHT, RESET);
-                if let Some(ref sender) = self.interrupt_sender {
-                    let _ = sender.send(InterruptSignal::CtrlC);
-                }
-                return Ok(Some(InputResult::Interrupted));
+                // Let terminal handle Ctrl+C for copying - do nothing
+                return Ok(None);
             }
 
             // Handle Backspace
@@ -207,8 +205,9 @@ impl InputHandler {
                 input_buffer.insert(char_index, c);
                 *cursor_pos += 1;
 
-                // Always redraw the line to show the new character and keep cursor position correct
-                self.redraw_line(input_buffer, *cursor_pos)?;
+                // Optimized: only print the character and move cursor, avoid full redraw
+                print!("{}", c);
+                io::stdout().flush()?;
             }
 
             _ => {} // Ignore other keys
@@ -352,7 +351,7 @@ pub enum InputResult {
     Interrupted,
 }
 
-/// Simple input reader with transparent large paste handling
+/// Simple input reader with minimal overhead for fast typing
 pub fn read_simple_input(prompt: &str) -> Result<String> {
     print!("{}", prompt);
     io::stdout().flush()?;
@@ -362,9 +361,13 @@ pub fn read_simple_input(prompt: &str) -> Result<String> {
         Ok(_) => {
             let trimmed = input.trim();
             
-            // Handle large pastes transparently (like Claude Code does)
-            if is_likely_large_paste(trimmed) {
-                handle_large_paste_simple(trimmed)
+            // Only check for large pastes if input is actually large
+            if trimmed.len() > 500 || trimmed.lines().count() > 5 {
+                if is_likely_large_paste(trimmed) {
+                    handle_large_paste_simple(trimmed)
+                } else {
+                    Ok(trimmed.to_string())
+                }
             } else {
                 Ok(trimmed.to_string())
             }
@@ -468,10 +471,10 @@ pub fn read_input_in_status_bar() -> Result<String> {
     result
 }
 
-/// Check for ESC key during operations (simple polling version)
+/// Check for ESC key during operations (optimized non-blocking version)
 pub async fn check_for_escape_key() -> bool {
-    // Use crossterm to check for ESC without blocking
-    if crossterm::event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
+    // Use crossterm to check for ESC without blocking (reduced polling)
+    if crossterm::event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
         if let Ok(event) = crossterm::event::read() {
             if let crossterm::event::Event::Key(key_event) = event {
                 return key_event.code == crossterm::event::KeyCode::Esc;

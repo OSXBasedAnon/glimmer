@@ -18,6 +18,9 @@ pub const GRAY_DIM: &str = "\x1b[90m";          // Dim gray
 pub const RED_ERROR: &str = "\x1b[91m";         // Bright red for errors
 pub const GREEN_SUCCESS: &str = "\x1b[32m";     // Green for success/additions
 pub const YELLOW_WARN: &str = "\x1b[93m";       // Bright yellow for warnings
+pub const ORANGE_EDIT: &str = "\x1b[38;2;255;175;0m";      // #ffaf00 for editing
+pub const YELLOW_ANALYZE: &str = "\x1b[38;2;255;204;92m";   // #ffcc5c for analyzing
+pub const GREEN_COMPLETE: &str = "\x1b[38;2;159;239;0m";    // #9fef00 for task completion
 pub const PURPLE_BOLD: &str = "\x1b[1;95m";     // Bold bright magenta/purple
 pub const PURPLE_BRIGHT: &str = "\x1b[95m";     // Bright magenta/purple
 

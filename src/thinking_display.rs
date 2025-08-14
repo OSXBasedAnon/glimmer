@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -207,6 +206,7 @@ static CURRENT_AI_THINKING: std::sync::Mutex<String> = std::sync::Mutex::new(Str
 static AI_INTERNAL_PROMPT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static AI_REASONING_STEPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+
 pub struct PersistentStatusBar;
 
 impl PersistentStatusBar {
@@ -318,8 +318,18 @@ impl PersistentStatusBar {
     
     /// Update status with token information and response time
     pub fn update_status_with_tokens_and_timing(message: &str, input_tokens: u32, output_tokens: Option<u32>, response_time_ms: u32) {
-        // Update the status using the new atomic system
-        Self::update_status(message);
+        // Format with token counts in the exact format specified
+        let token_format = if let Some(out_tokens) = output_tokens {
+            format!("({}\u{2192}{})", input_tokens, out_tokens)
+        } else {
+            format!("({})", input_tokens)
+        };
+        
+        // Don't reformat the message - it's already properly formatted from realtime.rs
+        let formatted_message = format!("{} {}", message, token_format);
+        
+        // Update the AI thinking display with formatted message
+        Self::set_ai_thinking(&formatted_message);
         
         // Update tokens
         if let Ok(mut tokens) = STATUS_BAR_TOKENS.lock() {
@@ -366,10 +376,52 @@ impl PersistentStatusBar {
         MEMORY_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed)
     }
     
-    /// Set the current AI thinking content (actual prompts/reasoning)
+    /// Set the current AI thinking content (actual prompts/reasoning) - rate limited to prevent UI spam
     pub fn set_ai_thinking(content: &str) {
+        // Filter out status messages but keep actual AI reasoning
+        let formatted_content = if content.contains("●") || content.contains("⎿") {
+            // Skip status indicator messages - they belong in chat, not thinking display
+            return;
+        } else if content == "Complete" {
+            // Skip generic "Complete" status
+            return;
+        } else if content.is_empty() {
+            // Allow clearing the thinking display
+            String::new()
+        } else {
+            // Keep all substantial AI reasoning content
+            content.to_string()
+        };
+        
+        // Rate limit status updates to prevent UI corruption but allow real-time feel
+        static LAST_UPDATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LAST_CONTENT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let last = LAST_UPDATE.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Check if content has actually changed to avoid spam
+        if let Ok(mut last_content) = LAST_CONTENT.try_lock() {
+            if *last_content == formatted_content {
+                return; // Same content, skip update
+            }
+            *last_content = formatted_content.clone();
+        }
+        
+        // Reduced rate limiting for better real-time feel - only 50ms between updates
+        if now - last < 50 {
+            // Allow high-priority updates through immediately
+            if !formatted_content.contains("Strategy:") {
+                return;
+            }
+        }
+        LAST_UPDATE.store(now, std::sync::atomic::Ordering::Relaxed);
+        
         if let Ok(mut thinking) = CURRENT_AI_THINKING.lock() {
-            *thinking = content.to_string();
+            // Avoid duplicate consecutive messages
+            if *thinking != formatted_content {
+                *thinking = formatted_content;
+            }
         }
     }
     
@@ -398,15 +450,29 @@ impl PersistentStatusBar {
         }
     }
     
-    /// Add a reasoning step to the current thinking
+    /// Add a colored reasoning step with proper ratatui formatting
+    pub fn add_colored_reasoning_step(indicator_color: (u8, u8, u8), text: &str) {
+        // Format for ratatui with color information embedded as a special marker
+        let formatted = format!("●<color:{},{},{}>{}", indicator_color.0, indicator_color.1, indicator_color.2, text);
+        Self::add_reasoning_step(&formatted);
+    }
+    
+    /// Add a reasoning step to the current thinking - ONLY for ● status indicators that go to chat history
     pub fn add_reasoning_step(step: &str) {
-        if let Ok(mut steps) = AI_REASONING_STEPS.lock() {
-            steps.push(step.to_string());
-            // Keep only recent steps (max 20)
-            if steps.len() > 20 {
-                steps.remove(0);
+        // Strip ANSI codes first to check for ● or ⎿
+        let clean_step = strip_ansi_codes_simple(step);
+        
+        // ONLY handle UI operation updates that contain ● or ⎿ - these go to chat history
+        if clean_step.contains("●") || clean_step.contains("⎿") {
+            // This is a real-time UI update - add directly to reasoning steps without rate limiting
+            if let Ok(mut steps) = AI_REASONING_STEPS.lock() {
+                steps.push(step.to_string());
             }
+            return;
         }
+        
+        // DO NOT add regular AI reasoning here - that should use set_ai_thinking instead
+        // This function is specifically for ● status indicators in chat history
     }
     
     /// Get the latest reasoning steps  
@@ -461,6 +527,33 @@ impl PersistentStatusBar {
             steps.clear();
         }
     }
+    
+}
+
+/// Simple ANSI code stripper for internal use
+fn strip_ansi_codes_simple(text: &str) -> String {
+    // Remove ANSI escape sequences like \x1b[38;2;255;204;92m and \x1b[0m
+    let mut result = String::new();
+    let mut in_escape = false;
+    let mut chars = text.chars();
+    
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+        
+        if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+            continue;
+        }
+        
+        result.push(ch);
+    }
+    
+    result
 }
 
 /// Helper functions for common thinking patterns

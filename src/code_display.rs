@@ -92,7 +92,7 @@ impl CodeDiffDisplay {
         Ok(output)
     }
 
-    pub fn display_diff(&self, original: &str, modified: &str, file_path: &Path) -> Result<()> {
+    pub fn display_diff(&self, _original: &str, _modified: &str, _file_path: &Path) -> Result<()> {
         // Silent method - no printing to avoid interfering with ratatui display
         // The diff will be shown in the function result summary instead
         Ok(())
@@ -203,13 +203,10 @@ pub fn display_code_file(file_path: &Path, content: &str) -> Result<()> {
 
 /// Display only a summary of what a file does, not its content
 pub fn display_file_summary(file_path: &Path, content: &str) -> Result<String> {
+    // This function should not print directly to stdout as it interferes with the ratatui UI.
+    // It should return the formatted summary string for the caller to display.
     let summary = analyze_file_purpose(file_path, content)?;
-    
-    println!("\n{}📖 **File Summary**: {}{}", 
-            EMERALD_BRIGHT, file_path.display(), RESET);
-    println!("{}", summary);
-    
-    Ok(summary)
+    Ok(format!("📖 **File Summary for {}**\n{}", file_path.display(), summary))
 }
 
 /// Analyze the purpose of a file based on its content and structure

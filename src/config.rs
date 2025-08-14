@@ -136,14 +136,17 @@ pub async fn load_config(config_path: Option<&Path>) -> Result<Config> {
         Config::default()
     };
 
-    // Try to load API key from .env file
-    if let Ok(env_path) = std::env::current_dir().map(|d| d.join(".env")) {
-        if env_path.exists() {
-            if let Ok(env_content) = fs::read_to_string(&env_path).await {
-                for line in env_content.lines() {
-                    if let Some(key_value) = line.strip_prefix("GEMINI_API_KEY=") {
-                        config.gemini.api_key = Some(key_value.trim().to_string());
-                        break;
+    // Try to load API key from .env file in the glimmer root directory
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let env_path = exe_dir.join(".env");
+            if env_path.exists() {
+                if let Ok(env_content) = fs::read_to_string(&env_path).await {
+                    for line in env_content.lines() {
+                        if let Some(key_value) = line.strip_prefix("GEMINI_API_KEY=") {
+                            config.gemini.api_key = Some(key_value.trim().to_string());
+                            break;
+                        }
                     }
                 }
             }

@@ -5,10 +5,24 @@ use crate::config::Config;
 use crate::gemini;
 use crate::cli::colors::{EMERALD_BRIGHT, BLUE_BRIGHT, GRAY_DIM, RESET};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RequestType {
+    DirectAnswer,
+    FunctionCalling,
+    Research,
+    Reasoning,
+    FileEdit,
+    FileRead,
+    General,
+}
+
 /// Advanced reasoning engine for handling ambiguous requests
 pub struct ReasoningEngine {
     config: Config,
     heuristic_database: HeuristicDatabase,
+    // Smart caching to eliminate redundant API calls
+    triage_cache: std::sync::Mutex<std::collections::HashMap<String, (RequestType, f32)>>,
+    pattern_weights: std::sync::Mutex<std::collections::HashMap<String, f32>>,
 }
 
 /// Database of heuristics for common ambiguous request patterns
@@ -108,7 +122,21 @@ impl ReasoningEngine {
         Self {
             config: config.clone(),
             heuristic_database,
+            triage_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pattern_weights: std::sync::Mutex::new(Self::initialize_pattern_weights()),
         }
+    }
+    
+    /// Initialize smart pattern weights based on usage patterns
+    fn initialize_pattern_weights() -> std::collections::HashMap<String, f32> {
+        let mut weights = std::collections::HashMap::new();
+        // File operations get highest weight (most common and reliable)
+        weights.insert("file_operation".to_string(), 0.95);
+        weights.insert("directory_operation".to_string(), 0.90);
+        weights.insert("code_modification".to_string(), 0.85);
+        weights.insert("knowledge_question".to_string(), 0.80);
+        weights.insert("greeting".to_string(), 0.75);
+        weights
     }
 
     /// Fast parallel reasoning with instant local analysis
@@ -116,47 +144,53 @@ impl ReasoningEngine {
         // Start multiple fast local analyses in parallel
         let request_lower = request.to_lowercase();
         
-        let (pattern_analysis, context_analysis, capability_analysis) = tokio::join!(
-            // Pattern matching (instant)
-            async {
-                (
-                    self.is_domain_request(&request_lower),
-                    self.is_improvement_request(&request_lower),
-                    self.is_selection_request(&request_lower),
-                    self.is_analysis_request(&request_lower)
-                )
-            },
-            
-            // Context analysis (instant)
-            async {
-                let has_file_refs = context.contains(".rs") || context.contains(".js") || context.contains(".py");
-                let has_error_context = context.contains("error") || context.contains("failed");
-                (has_file_refs, has_error_context)
-            },
-            
-            // Capability assessment (instant)
-            async {
-                vec![
-                    "I have access to conversation history via sled database".to_string(),
-                    "I can search for previous changes and content".to_string(),
-                    "I can analyze file structures and code".to_string(),
-                    "I can make intelligent inferences from context".to_string(),
-                ]
-            }
+        // Do all local analysis instantly (no async needed)
+        let pattern_analysis = (
+            self.is_domain_request(&request_lower),
+            self.is_improvement_request(&request_lower),
+            self.is_selection_request(&request_lower),
+            self.is_analysis_request(&request_lower)
         );
+        
+        let context_analysis = {
+            let has_file_refs = context.contains(".rs") || context.contains(".js") || context.contains(".py");
+            let has_error_context = context.contains("error") || context.contains("failed");
+            let codebase_size = self.estimate_codebase_size(&context);
+            let complexity_indicators = self.count_complexity_indicators(&request_lower, &context);
+            (has_file_refs, has_error_context, codebase_size, complexity_indicators)
+        };
+        
+        let capability_analysis = vec![
+            "I have access to conversation history via sled database".to_string(),
+            "I can search for previous changes and content".to_string(),
+            "I can analyze file structures and code".to_string(),
+            "I can make intelligent inferences from context".to_string(),
+        ];
         
         // Build reasoning result from parallel analysis (no API call needed!)
         let (is_domain, is_improvement, is_selection, is_analysis) = pattern_analysis;
-        let (has_files, has_errors) = context_analysis;
+        let (has_files, has_errors, codebase_size, complexity_indicators) = context_analysis;
+        
+        // Adjust confidence based on codebase size and complexity
+        let base_confidence = 0.9;
+        let complexity_penalty = (complexity_indicators as f32) * 0.1;
+        let codebase_penalty = match codebase_size {
+            3 => 0.2, // Large codebase - more uncertainty
+            2 => 0.1, // Medium codebase - some uncertainty  
+            _ => 0.0, // Small codebase - no penalty
+        };
+        
+        let adjusted_confidence = (base_confidence - complexity_penalty - codebase_penalty).max(0.3);
         
         let mut reasoning = ReasoningResult {
             interpretation: self.build_instant_interpretation(&request_lower, is_domain, is_improvement, is_selection, is_analysis),
             suggested_criteria: self.build_instant_criteria(&request_lower),
             clarification_questions: vec![], // Avoid asking questions - be proactive
-            confidence: 0.9, // High confidence in local analysis
+            confidence: adjusted_confidence,
             actionable_plan: self.build_instant_plan(&request_lower, has_files, has_errors),
             capability_assessment: capability_analysis.clone(),
-            metacognitive_notes: "Fast parallel local analysis - no API calls needed for basic reasoning".to_string(),
+            metacognitive_notes: format!("Fast local analysis - codebase_size:{}, complexity:{}, confidence:{:.2}", 
+                                       codebase_size, complexity_indicators, adjusted_confidence),
         };
         
         // Only use external AI if we genuinely can't handle locally
@@ -244,13 +278,13 @@ impl ReasoningEngine {
                         "I understand you want to create a new file at '{}' {}. Let me create that for you.",
                         path, description
                     )));
-                },
+                }
                 FileOperationIntent::EditExisting { path, changes } => {
                     return Ok(Some(format!(
                         "I understand you want to edit the existing file '{}' to {}. Let me modify that file.",
                         path, changes
                     )));
-                },
+                }
                 FileOperationIntent::CreateOrEdit { path, description } => {
                     // Check if file exists to decide
                     if std::path::Path::new(&path).exists() {
@@ -403,12 +437,24 @@ impl ReasoningEngine {
         Ok(data.into_iter().take(limit).collect())
     }
 
+    /// Simple triage method for compatibility (post-refactor: simplified)
+    pub async fn triage_request(&self, input: &str, _conversation_history: &[crate::cli::memory::ChatMessage]) -> Result<RequestType> {
+        // Simplified triage - let AI system handle complex request routing
+        if input.to_lowercase().contains("edit") || input.to_lowercase().contains("modify") {
+            Ok(RequestType::FileEdit)
+        } else if input.to_lowercase().contains("read") || input.to_lowercase().contains("show") {
+            Ok(RequestType::FileRead)
+        } else {
+            Ok(RequestType::General)
+        }
+    }
+
     /// Analyze if I'm capable of handling this request based on available functions
     pub async fn assess_my_capabilities(&self, request: &str, available_functions: &[String]) -> Result<CapabilityAssessment> {
         let functions_list = available_functions.join(", ");
         
         let prompt = format!(
-            r#"I am an AI assistant trying to determine if I can handle a user request.
+            r##"I am an AI assistant trying to determine if I can handle a user request.
 
 USER REQUEST: {}
 
@@ -429,7 +475,7 @@ Respond in JSON format:
     "reasoning": "why I think I can or cannot do this",
     "suggested_approach": "what I should try first",
     "experimental": true/false (if this requires creative function combination)
-}}"#,
+}}"##,
             request, functions_list
         );
 
@@ -533,20 +579,7 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about domain criteria...");
         
         let prompt = format!(
-            "The user wants to evaluate domains with this request: '{}'\n\
-            Context: {}\n\n\
-            Generate specific, actionable criteria for evaluating domains. Consider:\n\
-            - Business value and brandability\n\
-            - Technical factors (length, TLD, etc.)\n\
-            - Market considerations\n\
-            - User intent and industry\n\n\
-            Provide a JSON response with:\n\
-            {{\n\
-                \"interpretation\": \"What the user likely wants\",\n\
-                \"criteria\": [\"criterion1\", \"criterion2\", ...],\n\
-                \"questions\": [\"clarifying question1\", ...],\n\
-                \"confidence\": 0.8\n\
-            }}",
+            "The user wants to evaluate domains with this request: '{}'\n\nContext: {}\n\nGenerate specific, actionable criteria for evaluating domains. Consider:\n\n- Business value and brandability\n- Technical factors (length, TLD, etc.)\n- Market considerations\n- User intent and industry\n\nProvide a JSON response with:\n{{\n    \"interpretation\": \"What the user likely wants\",\n    \"criteria\": [\"criterion1\", \"criterion2\", ...],\n    \"questions\": [\"clarifying question1\", ...],\n    \"confidence\": 0.8\n}}",
             request, context
         );
 
@@ -573,15 +606,7 @@ Respond in JSON format:
         if suggested_improvements.is_empty() {
             // Fallback to AI reasoning
             let prompt = format!(
-                "The user wants to improve code with this request: '{}'\n\
-                Context: {}\n\n\
-                What specific improvements should be made? Consider:\n\
-                - Performance optimizations\n\
-                - Code readability and maintainability\n\
-                - Error handling and robustness\n\
-                - Modern best practices\n\
-                - Security considerations\n\n\
-                Provide specific, actionable improvement suggestions.",
+                "The user wants to improve code with this request: '{}'\n\nContext: {}\n\nWhat specific improvements should be made? Consider:\n\n- Performance optimizations\n- Code readability and maintainability\n- Error handling and robustness\n- Modern best practices\n- Security considerations\n\nProvide specific, actionable improvement suggestions.",
                 request, context
             );
 
@@ -595,7 +620,7 @@ Respond in JSON format:
 
         Ok(ReasoningResult {
             interpretation: format!("Code improvement request focusing on: {}", 
-                matching_patterns.iter()
+                matching_patterns.iter() 
                     .map(|p| p.description.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")),
@@ -623,14 +648,7 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about selection criteria...");
 
         let prompt = format!(
-            "The user wants to select/filter items with: '{}'\n\
-            Context: {}\n\n\
-            What are the most logical selection criteria? Consider:\n\
-            - Quality indicators\n\
-            - Relevance factors\n\
-            - User preferences\n\
-            - Practical constraints\n\n\
-            Provide specific, measurable criteria for selection.",
+            "The user wants to select/filter items with: '{}'\n\nContext: {}\n\nWhat are the most logical selection criteria? Consider:\n\n- Quality indicators\n- Relevance factors\n- User preferences\n- Practical constraints\n\nProvide specific, measurable criteria for selection.",
             request, context
         );
 
@@ -645,14 +663,7 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about analysis approach...");
 
         let prompt = format!(
-            "The user wants analysis with: '{}'\n\
-            Context: {}\n\n\
-            What should be analyzed and how? Consider:\n\
-            - Key metrics and indicators\n\
-            - Comparative analysis\n\
-            - Trends and patterns\n\
-            - Actionable insights\n\n\
-            Provide a structured analysis approach.",
+            "The user wants analysis with: '{}'\n\nContext: {}\n\nWhat should be analyzed and how? Consider:\n\n- Key metrics and indicators\n- Comparative analysis\n- Trends and patterns\n- Actionable insights\n\nProvide a structured analysis approach.",
             request, context
         );
 
@@ -667,14 +678,7 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about ambiguous request...");
 
         let prompt = format!(
-            "The user made this ambiguous request: '{}'\n\
-            Context: {}\n\n\
-            Help clarify what they might want by:\n\
-            1. Interpreting the most likely intent\n\
-            2. Suggesting specific criteria or parameters\n\
-            3. Asking clarifying questions\n\
-            4. Providing an actionable plan\n\n\
-            Be specific and helpful in your suggestions.",
+            "The user made this ambiguous request: '{}'\n\nContext: {}\n\nHelp clarify what they might want by:\n1. Interpreting the most likely intent\n2. Suggesting specific criteria or parameters\n3. Asking clarifying questions\n4. Providing an actionable plan\n\nBe specific and helpful in your suggestions.",
             request, context
         );
 
@@ -693,7 +697,7 @@ Respond in JSON format:
 
             let criteria = json_value.get("criteria")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter()
+                .map(|arr| arr.iter() 
                     .filter_map(|v| v.as_str())
                     .map(|s| s.to_string())
                     .collect())
@@ -754,8 +758,11 @@ Respond in JSON format:
     pub fn present_reasoning(&self, reasoning: &ReasoningResult) -> String {
         let mut output = String::new();
         
-        output.push_str(&format!("{}🧠 **Reasoning Analysis**{}\n", EMERALD_BRIGHT, RESET));
-        output.push_str(&format!("**Interpretation**: {}\n\n", reasoning.interpretation));
+        output.push_str(&format!("{}🧠 **Reasoning Analysis**{}
+", EMERALD_BRIGHT, RESET));
+        output.push_str(&format!("**Interpretation**: {}
+
+", reasoning.interpretation));
         
         if !reasoning.suggested_criteria.is_empty() {
             output.push_str("**Suggested Criteria**:\n");
@@ -768,7 +775,7 @@ Respond in JSON format:
         if !reasoning.clarification_questions.is_empty() {
             output.push_str("**Clarifying Questions**:\n");
             for question in &reasoning.clarification_questions {
-                output.push_str(&format!("{}• {}{}\n", GRAY_DIM, question, RESET));
+                output.push_str(&format!("{}{}{}\n", GRAY_DIM, question, RESET));
             }
             output.push('\n');
         }
@@ -778,6 +785,55 @@ Respond in JSON format:
         output.push_str(&format!("{}Would you like me to proceed with these criteria, or would you like to specify different ones?{}", GRAY_DIM, RESET));
 
         output
+    }
+    
+    /// Estimate codebase size from context for complexity escalation
+    pub fn estimate_codebase_size(&self, context: &str) -> u32 {
+        // Count file references and project indicators
+        let file_count = context.matches(".rs").count() + 
+                        context.matches(".js").count() + 
+                        context.matches(".py").count() +
+                        context.matches(".ts").count() +
+                        context.matches(".jsx").count();
+        
+        let has_large_indicators = context.contains("src/") || 
+                                  context.contains("modules/") ||
+                                  context.contains("components/") ||
+                                  context.contains("packages/");
+        
+        if file_count > 50 || has_large_indicators {
+            3 // Large codebase
+        } else if file_count > 10 {
+            2 // Medium codebase  
+        } else {
+            1 // Small codebase
+        }
+    }
+    
+    /// Count complexity indicators that might escalate simple requests
+    pub fn count_complexity_indicators(&self, request: &str, context: &str) -> u32 {
+        let mut score = 0;
+        
+        // Request complexity indicators
+        if request.contains("all") || request.contains("every") || request.contains("entire") {
+            score += 2;
+        }
+        if request.contains("refactor") || request.contains("optimize") || request.contains("improve") {
+            score += 1;
+        }
+        if request.contains("multiple") || request.contains("several") {
+            score += 1;
+        }
+        
+        // Context complexity indicators
+        if context.contains("error") || context.contains("failed") {
+            score += 1;
+        }
+        if context.contains("dependencies") || context.contains("imports") {
+            score += 1;
+        }
+        
+        score
     }
 }
 
@@ -915,7 +971,7 @@ impl EditFailureReasoning {
     /// Analyze an edit failure using an LLM for more generic and powerful reasoning.
     pub async fn analyze(request: &str, current_content: &str, user_feedback: &str, config: &Config) -> Result<Self> {
         let prompt = format!(
-            r#"An AI code editing task failed. Analyze the situation to determine the cause and recommend a new approach.
+            r##"An AI code editing task failed. Analyze the situation to determine the cause and recommend a new approach.
 
             **Original User Request:**
             "{}"
@@ -940,7 +996,7 @@ impl EditFailureReasoning {
                 "likely_problem": "...",
                 "recommended_approach": "...",
                 "user_frustration_level": 8
-            }}"#,
+            }}"##,
             request, user_feedback, current_content.chars().take(2000).collect::<String>()
         );
 
