@@ -103,7 +103,7 @@ Usage: glimmer [OPTIONS] [COMMAND]
 
 Commands:
   edit    Modifies files with AI assistance. Accepts a file path and a natural language instruction.
-  chat    Initializes a persistent, interactive chat session.
+  clear   Clears the chat from context memory.
   export  Exports a conversation history to a specified format.
   compact Compacts project files for a focused context window.
   help    Print this message or the help of the given subcommand(s)
@@ -112,6 +112,7 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
 
 
