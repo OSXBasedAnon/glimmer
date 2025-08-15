@@ -241,7 +241,7 @@ impl MemoryEngine {
             } else {
                 // Long text - summarize key points
                 format!("{}...\n[Message truncated - {} chars total]", 
-                    &content[..content.len().min(200)], content.len())
+                    content.chars().take(200).collect::<String>(), content.len())
             }
         } else {
             content.to_string()
@@ -298,7 +298,7 @@ impl MemoryEngine {
         } else {
             // Large non-code content
             format!("{}...\n[Content truncated - {} total chars]", 
-                &content[..content.len().min(300)], content.len())
+                content.chars().take(300).collect::<String>(), content.len())
         }
     }
 

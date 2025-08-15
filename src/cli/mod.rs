@@ -4,7 +4,6 @@ pub mod parse;
 pub mod gemini;
 pub mod diff;
 pub mod watch;
-pub mod lsp;
 pub mod permissions;
 pub mod chat;
 pub mod chat_ui;

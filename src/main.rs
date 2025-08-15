@@ -10,9 +10,7 @@ mod file_io;
 mod parser;
 mod gemini;
 mod differ;
-mod lsp;
 mod permissions;
-mod research;
 mod function_calling;
 mod code_display;
 mod progress_display;
@@ -126,12 +124,6 @@ enum Commands {
         command: Option<String>,
     },
 
-    /// Start Language Server Protocol (LSP) server
-    Lsp {
-        /// Port to bind LSP server
-        #[arg(short, long, default_value = "9257")]
-        port: u16,
-    },
 
     /// Manage folder permissions
     Permissions {
@@ -257,10 +249,6 @@ async fn main() -> Result<()> {
         Some(Commands::Watch { path, pattern, command }) => {
             info!("Starting watch on path: {} with pattern: {}", path.display(), pattern);
             cli::watch::handle_watch(path, pattern, command).await?;
-        }
-        Some(Commands::Lsp { port }) => {
-            info!("Starting LSP server on port: {}", port);
-            cli::lsp::handle_lsp(port).await?;
         }
         Some(Commands::Permissions { action }) => {
             cli::permissions::handle_permissions(action).await?;

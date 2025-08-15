@@ -400,6 +400,7 @@ impl ReasoningEngine {
         // Fallback: return the request itself
         request.to_string()
     }
+
     
     /// Analyze ambiguous request and generate intelligent response
     pub async fn reason_about_request(&self, request: &str, context: &str) -> Result<ReasoningResult> {
@@ -545,6 +546,404 @@ Which is it? Respond: A or B"#,
         }
     }
 
+    /// PRODUCTION-LEVEL: Real-time capability assessment with learning
+    pub async fn assess_capabilities_dynamically(&self, request: &str, available_functions: &[String], conversation_history: &[crate::cli::memory::ChatMessage]) -> Result<AdvancedCapabilityAssessment> {
+        // STEP 1: Understand request complexity and requirements
+        let complexity_analysis = self.analyze_request_complexity(request, conversation_history).await?;
+        
+        // STEP 2: Map available capabilities to requirements
+        let capability_mapping = self.map_functions_to_requirements(&complexity_analysis, available_functions).await?;
+        
+        // STEP 3: Self-assess confidence based on past performance
+        let performance_context = self.get_performance_context(request, conversation_history).await?;
+        
+        // STEP 4: Dynamic confidence adjustment
+        let adjusted_confidence = self.calculate_dynamic_confidence(&complexity_analysis, &capability_mapping, &performance_context);
+        
+        let recommended_approach = self.generate_approach_strategy(&complexity_analysis, &capability_mapping).await?;
+        let potential_limitations = self.identify_potential_limitations(&complexity_analysis, available_functions);
+        let learning_insights = performance_context.insights.clone();
+
+        Ok(AdvancedCapabilityAssessment {
+            complexity_analysis,
+            capability_mapping,
+            performance_context,
+            overall_confidence: adjusted_confidence,
+            can_attempt: adjusted_confidence > 0.3,
+            recommended_approach,
+            potential_limitations,
+            learning_insights,
+        })
+    }
+
+    /// Analyze request complexity like Claude Code does
+    async fn analyze_request_complexity(&self, request: &str, history: &[crate::cli::memory::ChatMessage]) -> Result<ComplexityAnalysis> {
+        let context = if history.len() > 0 {
+            history.iter()
+                .rev()
+                .take(3)
+                .map(|msg| format!("{}: {}", 
+                    match msg.role { 
+                        crate::cli::memory::MessageRole::User => "User",
+                        crate::cli::memory::MessageRole::Assistant => "Assistant",
+                        crate::cli::memory::MessageRole::System => "System",
+                    },
+                    msg.content.chars().take(100).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            "No prior context".to_string()
+        };
+
+        let analysis_prompt = format!(
+            r#"Analyze this request's complexity and requirements with FULL HONESTY:
+
+REQUEST: "{}"
+
+CONTEXT:
+{}
+
+Analyze:
+1. Technical complexity (1-10)
+2. Number of steps required
+3. Domain expertise needed
+4. Potential failure points
+5. Success probability based on request clarity
+
+Return JSON:
+{{
+    "complexity_score": 1-10,
+    "technical_domains": ["programming", "research", "analysis", etc],
+    "required_steps": ["step1", "step2", ...],
+    "failure_risks": ["risk1", "risk2", ...],
+    "success_probability": 0.0-1.0,
+    "clarity_score": 0.0-1.0,
+    "reasoning": "detailed analysis"
+}}"#,
+            request, context
+        );
+
+        let response = crate::gemini::query_gemini(&analysis_prompt, &self.config).await?;
+        self.parse_complexity_analysis(&response)
+    }
+
+    /// Map available functions to request requirements
+    async fn map_functions_to_requirements(&self, complexity: &ComplexityAnalysis, functions: &[String]) -> Result<CapabilityMapping> {
+        let mapping_prompt = format!(
+            r#"Map these available functions to the request requirements:
+
+REQUEST ANALYSIS:
+- Complexity: {}
+- Domains: {:?}
+- Required steps: {:?}
+- Risks: {:?}
+
+AVAILABLE FUNCTIONS:
+{}
+
+Determine:
+1. Which functions are directly useful
+2. Which combinations might work
+3. What's missing for complete solution
+4. Confidence in function adequacy
+
+Return JSON:
+{{
+    "directly_useful": ["function names"],
+    "useful_combinations": [["func1", "func2"], ["func3", "func4"]],
+    "missing_capabilities": ["what we lack"],
+    "function_adequacy_score": 0.0-1.0,
+    "optimal_sequence": ["recommended order of function calls"]
+}}"#,
+            complexity.complexity_score,
+            complexity.technical_domains,
+            complexity.required_steps,
+            complexity.failure_risks,
+            functions.join("\n")
+        );
+
+        let response = crate::gemini::query_gemini(&mapping_prompt, &self.config).await?;
+        self.parse_capability_mapping(&response)
+    }
+
+    /// Get performance context from conversation history
+    async fn get_performance_context(&self, request: &str, history: &[crate::cli::memory::ChatMessage]) -> Result<PerformanceContext> {
+        // Look for similar past requests and their outcomes
+        let similar_requests = history.iter()
+            .rev()
+            .take(20)
+            .filter(|msg| {
+                msg.role == crate::cli::memory::MessageRole::User &&
+                self.requests_are_similar(request, &msg.content)
+            })
+            .collect::<Vec<_>>();
+
+        if similar_requests.is_empty() {
+            return Ok(PerformanceContext {
+                past_success_rate: 0.5, // Neutral assumption
+                similar_request_count: 0,
+                recent_failures: vec![],
+                insights: vec!["No similar past requests found".to_string()],
+                confidence_adjustment: 0.0,
+            });
+        }
+
+        // Analyze outcomes of similar requests
+        let performance_prompt = format!(
+            r#"Analyze past performance on similar requests:
+
+CURRENT REQUEST: "{}"
+
+SIMILAR PAST REQUESTS:
+{}
+
+Look for patterns in:
+1. Success/failure rates
+2. Common issues encountered
+3. What worked well
+4. Areas for improvement
+
+Return JSON:
+{{
+    "estimated_success_rate": 0.0-1.0,
+    "common_issues": ["issue1", "issue2"],
+    "success_factors": ["factor1", "factor2"],
+    "confidence_adjustment": -0.2 to +0.2,
+    "insights": ["learning from past performance"]
+}}"#,
+            request,
+            similar_requests.iter()
+                .enumerate()
+                .map(|(i, msg)| format!("Request {}: {}", i+1, msg.content.chars().take(150).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let response = crate::gemini::query_gemini(&performance_prompt, &self.config).await?;
+        self.parse_performance_context(&response)
+    }
+
+    /// Calculate dynamic confidence based on all factors
+    fn calculate_dynamic_confidence(&self, complexity: &ComplexityAnalysis, mapping: &CapabilityMapping, performance: &PerformanceContext) -> f32 {
+        let mut confidence = 0.7; // Base confidence
+        
+        // Adjust for complexity
+        confidence -= (complexity.complexity_score as f32 - 5.0) * 0.05;
+        
+        // Adjust for clarity
+        confidence += (complexity.clarity_score - 0.5) * 0.3;
+        
+        // Adjust for function adequacy
+        confidence += (mapping.function_adequacy_score - 0.5) * 0.4;
+        
+        // Adjust based on past performance
+        confidence += performance.confidence_adjustment;
+        
+        // Success probability factor
+        confidence = (confidence + complexity.success_probability) / 2.0;
+        
+        confidence.max(0.0).min(1.0)
+    }
+
+    /// Generate strategic approach
+    async fn generate_approach_strategy(&self, complexity: &ComplexityAnalysis, mapping: &CapabilityMapping) -> Result<String> {
+        let strategy_prompt = format!(
+            r#"Generate an optimal approach strategy:
+
+COMPLEXITY ANALYSIS:
+- Score: {}
+- Steps: {:?}
+- Risks: {:?}
+
+CAPABILITY MAPPING:
+- Useful functions: {:?}
+- Optimal sequence: {:?}
+- Missing: {:?}
+
+Provide a strategic approach that:
+1. Minimizes failure risk
+2. Uses available functions optimally
+3. Handles edge cases
+4. Has fallback plans
+
+STRATEGY:"#,
+            complexity.complexity_score,
+            complexity.required_steps,
+            complexity.failure_risks,
+            mapping.directly_useful,
+            mapping.optimal_sequence,
+            mapping.missing_capabilities
+        );
+
+        crate::gemini::query_gemini(&strategy_prompt, &self.config).await
+    }
+
+    /// Identify potential limitations
+    fn identify_potential_limitations(&self, complexity: &ComplexityAnalysis, functions: &[String]) -> Vec<String> {
+        let mut limitations = Vec::new();
+        
+        if complexity.complexity_score > 7 {
+            limitations.push("High complexity task - may require multiple attempts".to_string());
+        }
+        
+        if complexity.clarity_score < 0.6 {
+            limitations.push("Request clarity is low - may misinterpret requirements".to_string());
+        }
+        
+        if functions.is_empty() {
+            limitations.push("No tools available - limited to text responses only".to_string());
+        }
+        
+        for risk in &complexity.failure_risks {
+            limitations.push(format!("Risk: {}", risk));
+        }
+        
+        limitations
+    }
+
+    /// Check if two requests are similar
+    fn requests_are_similar(&self, req1: &str, req2: &str) -> bool {
+        let req1_lower = req1.to_lowercase();
+        let req2_lower = req2.to_lowercase();
+        
+        let req1_words: std::collections::HashSet<_> = req1_lower
+            .split_whitespace()
+            .filter(|w| w.len() > 3)
+            .collect();
+        
+        let req2_words: std::collections::HashSet<_> = req2_lower
+            .split_whitespace()
+            .filter(|w| w.len() > 3)
+            .collect();
+        
+        let intersection: std::collections::HashSet<_> = req1_words.intersection(&req2_words).collect();
+        let union: std::collections::HashSet<_> = req1_words.union(&req2_words).collect();
+        
+        if union.is_empty() { return false; }
+        (intersection.len() as f32 / union.len() as f32) > 0.3
+    }
+
+    fn parse_complexity_analysis(&self, response: &str) -> Result<ComplexityAnalysis> {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
+            Ok(ComplexityAnalysis {
+                complexity_score: json.get("complexity_score")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5) as u32,
+                technical_domains: json.get("technical_domains")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                required_steps: json.get("required_steps")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                failure_risks: json.get("failure_risks")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                success_probability: json.get("success_probability")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5) as f32,
+                clarity_score: json.get("clarity_score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5) as f32,
+            })
+        } else {
+            Ok(ComplexityAnalysis {
+                complexity_score: 5,
+                technical_domains: vec!["unknown".to_string()],
+                required_steps: vec!["analyze request".to_string()],
+                failure_risks: vec!["parsing failed".to_string()],
+                success_probability: 0.3,
+                clarity_score: 0.3,
+            })
+        }
+    }
+
+    fn parse_capability_mapping(&self, response: &str) -> Result<CapabilityMapping> {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
+            Ok(CapabilityMapping {
+                directly_useful: json.get("directly_useful")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                function_adequacy_score: json.get("function_adequacy_score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5) as f32,
+                missing_capabilities: json.get("missing_capabilities")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                optimal_sequence: json.get("optimal_sequence")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+            })
+        } else {
+            Ok(CapabilityMapping {
+                directly_useful: vec![],
+                function_adequacy_score: 0.3,
+                missing_capabilities: vec!["Analysis failed".to_string()],
+                optimal_sequence: vec![],
+            })
+        }
+    }
+
+    fn parse_performance_context(&self, response: &str) -> Result<PerformanceContext> {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
+            Ok(PerformanceContext {
+                past_success_rate: json.get("estimated_success_rate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5) as f32,
+                similar_request_count: 1, // Simplified
+                recent_failures: json.get("common_issues")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                insights: json.get("insights")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect())
+                    .unwrap_or_default(),
+                confidence_adjustment: json.get("confidence_adjustment")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32,
+            })
+        } else {
+            Ok(PerformanceContext {
+                past_success_rate: 0.5,
+                similar_request_count: 0,
+                recent_failures: vec![],
+                insights: vec!["Performance analysis failed".to_string()],
+                confidence_adjustment: 0.0,
+            })
+        }
+    }
+
+    /// Legacy method for backward compatibility
     /// Analyze if I'm capable of handling this request based on available functions
     pub async fn assess_my_capabilities(&self, request: &str, available_functions: &[String]) -> Result<CapabilityAssessment> {
         let functions_list = available_functions.join(", ");
@@ -1045,7 +1444,47 @@ pub struct EditFailureReasoning {
     pub should_try_different_approach: bool,
 }
 
-/// Assessment of my capabilities for a given request
+/// Advanced capability assessment with learning and metacognition
+#[derive(Debug, Clone)]
+pub struct AdvancedCapabilityAssessment {
+    pub complexity_analysis: ComplexityAnalysis,
+    pub capability_mapping: CapabilityMapping,
+    pub performance_context: PerformanceContext,
+    pub overall_confidence: f32,
+    pub can_attempt: bool,
+    pub recommended_approach: String,
+    pub potential_limitations: Vec<String>,
+    pub learning_insights: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComplexityAnalysis {
+    pub complexity_score: u32, // 1-10
+    pub technical_domains: Vec<String>,
+    pub required_steps: Vec<String>,
+    pub failure_risks: Vec<String>,
+    pub success_probability: f32,
+    pub clarity_score: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityMapping {
+    pub directly_useful: Vec<String>,
+    pub function_adequacy_score: f32,
+    pub missing_capabilities: Vec<String>,
+    pub optimal_sequence: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceContext {
+    pub past_success_rate: f32,
+    pub similar_request_count: usize,
+    pub recent_failures: Vec<String>,
+    pub insights: Vec<String>,
+    pub confidence_adjustment: f32,
+}
+
+/// Legacy assessment structure for backward compatibility
 #[derive(Debug, Clone)]
 pub struct CapabilityAssessment {
     pub can_attempt: bool,

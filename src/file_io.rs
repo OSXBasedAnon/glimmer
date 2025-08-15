@@ -55,36 +55,42 @@ pub async fn write_file(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("Failed to write file: {}", path.display()))
 }
 
-pub fn detect_language(path: &Path) -> String {
-    if let Some(extension) = path.extension().and_then(|s| s.to_str()) {
-        match extension.to_lowercase().as_str() {
-            "rs" => "rust".to_string(),
-            "py" => "python".to_string(),
-            "js" | "mjs" => "javascript".to_string(),
-            "ts" => "typescript".to_string(),
-            "go" => "go".to_string(),
-            "java" => "java".to_string(),
-            "cpp" | "cc" | "cxx" => "cpp".to_string(),
-            "c" => "c".to_string(),
-            "cs" => "csharp".to_string(),
-            "php" => "php".to_string(),
-            "rb" => "ruby".to_string(),
-            "swift" => "swift".to_string(),
-            "kt" => "kotlin".to_string(),
-            "scala" => "scala".to_string(),
-            "sh" | "bash" => "bash".to_string(),
-            "ps1" => "powershell".to_string(),
-            "html" | "htm" => "html".to_string(),
-            "css" => "css".to_string(),
-            "scss" | "sass" => "scss".to_string(),
-            "json" => "json".to_string(),
-            "xml" => "xml".to_string(),
-            "yaml" | "yml" => "yaml".to_string(),
-            "toml" => "toml".to_string(),
-            "md" => "markdown".to_string(),
-            "sql" => "sql".to_string(),
-            _ => "text".to_string(),
+/// AI-powered language detection from file content and path
+pub async fn detect_language_ai(path: &Path, content: &str, config: &crate::config::Config) -> String {
+    let detection_prompt = format!(
+        "Analyze this file and determine its programming language.
+
+FILE PATH: {}
+CONTENT SAMPLE: {}
+
+Consider:
+- File extension
+- Syntax patterns
+- Language-specific keywords
+- File structure
+
+Respond with only the language name (e.g., rust, python, javascript, html, css, etc.)",
+        path.display(),
+        content.chars().take(1000).collect::<String>() // First 1000 chars for analysis
+    );
+    
+    match crate::gemini::query_gemini_fast(&detection_prompt, config).await {
+        Ok(response) => response.trim().to_lowercase(),
+        Err(_) => {
+            // Fallback: minimal extension-based detection
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                ext.to_lowercase()
+            } else {
+                "text".to_string()
+            }
         }
+    }
+}
+
+/// Legacy function - kept for backward compatibility but should migrate to AI detection
+pub fn detect_language(path: &Path) -> String {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        ext.to_lowercase()
     } else {
         "text".to_string()
     }

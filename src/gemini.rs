@@ -432,7 +432,7 @@ async fn make_request(
                 Some(fallback_response) => Ok(fallback_response),
                 None => {
                     let _preview = if response_text.len() > 200 {
-                        format!("{}...", &response_text[..200])
+                        format!("{}...", response_text.chars().take(200).collect::<String>())
                     } else {
                         response_text.clone()
                     };
@@ -457,7 +457,7 @@ async fn make_request(
                     } else {
                         Err(anyhow::anyhow!(
                             "Unable to parse Gemini API response. Response preview: {}", 
-                            if response_text.len() > 500 { format!("{}...", &response_text[..500]) } else { response_text.clone() }
+                            if response_text.len() > 500 { format!("{}...", response_text.chars().take(500).collect::<String>()) } else { response_text.clone() }
                         ))
                     }
                 }
@@ -538,7 +538,7 @@ async fn parse_gemini_response(response: reqwest::Response) -> Result<GeminiResp
                 Some(fallback_response) => Ok(fallback_response),
                 None => {
                     let _preview = if response_text.len() > 200 {
-                        format!("{}...", &response_text[..200])
+                        format!("{}...", response_text.chars().take(200).collect::<String>())
                     } else {
                         response_text.clone()
                     };
@@ -563,7 +563,7 @@ async fn parse_gemini_response(response: reqwest::Response) -> Result<GeminiResp
                     } else {
                         Err(anyhow::anyhow!(
                             "Unable to parse Gemini API response. Response preview: {}", 
-                            if response_text.len() > 500 { format!("{}...", &response_text[..500]) } else { response_text.clone() }
+                            if response_text.len() > 500 { format!("{}...", response_text.chars().take(500).collect::<String>()) } else { response_text.clone() }
                         ))
                     }
                 }
@@ -1610,7 +1610,7 @@ Use available functions proactively to complete tasks efficiently.".to_string(),
             // Skip "Waiting for AI response" - redundant
             // Show what we're actually asking the AI
             let thinking_preview = if prompt.len() > 100 {
-                format!("💭 Analyzing: {}", &prompt[..100].replace('\n', " "))
+                format!("💭 Analyzing: {}", prompt.chars().take(100).collect::<String>().replace('\n', " "))
             } else {
                 format!("💭 Processing: {}", prompt.replace('\n', " "))
             };
@@ -1656,7 +1656,7 @@ Use available functions proactively to complete tasks efficiently.".to_string(),
                     // Just update thinking, don't add to reasoning steps
                     // Show more meaningful status about the completion
                     let response_preview = if text.len() > 50 { 
-                        format!("{}...", &text[..50].replace('\n', " ")) 
+                        text.chars().take(50).collect::<String>().replace('\n', " ") 
                     } else { 
                         text.replace('\n', " ") 
                     };
@@ -1789,7 +1789,7 @@ async fn make_advanced_request(
                 Some(fallback_response) => Ok(fallback_response),
                 None => {
                     let _preview = if response_text.len() > 200 {
-                        format!("{}...", &response_text[..200])
+                        format!("{}...", response_text.chars().take(200).collect::<String>())
                     } else {
                         response_text.clone()
                     };
@@ -1814,7 +1814,7 @@ async fn make_advanced_request(
                     } else {
                         Err(anyhow::anyhow!(
                             "Unable to parse Gemini API response. Response preview: {}", 
-                            if response_text.len() > 500 { format!("{}...", &response_text[..500]) } else { response_text.clone() }
+                            if response_text.len() > 500 { format!("{}...", response_text.chars().take(500).collect::<String>()) } else { response_text.clone() }
                         ))
                     }
                 }
@@ -1895,8 +1895,16 @@ fn extract_thinking_content(text: &str) -> (String, Option<String>) {
             let thinking_content = text[thinking_start + 10..thinking_end].trim().to_string();
             
             // Robust main content extraction
-            let before_thinking = text[..thinking_start].trim();
-            let after_thinking = text[thinking_end + 11..].trim();
+            let before_thinking = text.char_indices()
+                .nth(thinking_start)
+                .map(|(i, _)| &text[..i])
+                .unwrap_or("")
+                .trim();
+            let after_thinking = if thinking_end + 11 < text.len() { 
+                &text[thinking_end + 11..] 
+            } else { 
+                "" 
+            }.trim();
             let main_content = if before_thinking.is_empty() && after_thinking.is_empty() {
                 // If no content outside thinking tags, return original text to be safe
                 text.to_string()

@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::gemini;
 use crate::cli::memory::{MemoryEngine, MessageRole, ChatMessage};
 use crate::function_calling::{FunctionRegistry, create_function_calling_prompt, execute_function_call};
-use crate::research;
 use crate::{warn_println};
 // Removed unused color imports
 use crate::cli::chat_ui::{ChatUI, SystemMessageType};
@@ -595,21 +594,26 @@ fn parse_markdown_line(text: &str) -> Line {
     if text.contains("<color:") {
         if let Some(color_start) = text.find("<color:") {
             if let Some(color_end) = text.find(">") {
-                let color_part = &text[color_start + 7..color_end]; // Extract "r,g,b"
-                let before_part = &text[..color_start]; // Before <color:...>
-                let after_part = &text[color_end + 1..]; // After >
+                // Safe slicing - find() returns byte positions, but since we're looking for ASCII strings,
+                // these should be valid character boundaries
+                if text.is_char_boundary(color_start) && text.is_char_boundary(color_start + 7) && 
+                   text.is_char_boundary(color_end) && text.is_char_boundary(color_end + 1) {
+                    let color_part = &text[color_start + 7..color_end]; // Extract "r,g,b"
+                    let before_part = &text[..color_start]; // Before <color:...>
+                    let after_part = &text[color_end + 1..]; // After >
                 
-                // Parse RGB values
-                let rgb: Vec<&str> = color_part.split(',').collect();
-                if rgb.len() == 3 {
-                    if let (Ok(r), Ok(g), Ok(b)) = (rgb[0].parse::<u8>(), rgb[1].parse::<u8>(), rgb[2].parse::<u8>()) {
-                        let spans = vec![
-                            Span::styled(before_part, Style::default().fg(Color::Rgb(r, g, b))), // Colored ● part
-                            Span::styled(after_part, Style::default().fg(Color::White)) // White text
-                        ];
-                        return Line::from(spans);
+                    // Parse RGB values
+                    let rgb: Vec<&str> = color_part.split(',').collect();
+                    if rgb.len() == 3 {
+                        if let (Ok(r), Ok(g), Ok(b)) = (rgb[0].parse::<u8>(), rgb[1].parse::<u8>(), rgb[2].parse::<u8>()) {
+                            let spans = vec![
+                                Span::styled(before_part, Style::default().fg(Color::Rgb(r, g, b))), // Colored ● part
+                                Span::styled(after_part, Style::default().fg(Color::White)) // White text
+                            ];
+                            return Line::from(spans);
+                        }
                     }
-                }
+                } // Close the is_char_boundary check
             }
         }
     }
@@ -848,25 +852,33 @@ pub async fn handle_chat(
     })?;
 
     let mut needs_redraw = false;
+    let mut last_render_time = std::time::Instant::now();
     
-    // Timing-based paste detection since crossterm bracketed paste is broken on Windows
-    let mut paste_buffer = String::new();
+    // OPTIMIZED: Timing-based paste detection with improved buffering
+    let mut paste_buffer = String::with_capacity(8192); // Pre-allocate for better performance
     let mut last_char_time = std::time::Instant::now();
     let mut is_pasting = false;
     let mut last_paste_content = String::new(); // Store actual paste content
     let mut show_paste_placeholder = false; // Flag to show clean placeholder
     let mut last_char: Option<char> = None; // Store the previous character
-    // Timing thresholds for paste detection
-    let paste_threshold = std::time::Duration::from_millis(25); // Very fast input = pasting
-    let paste_end_threshold = std::time::Duration::from_millis(150); // Gap = end of paste
+    let mut paste_char_count = 0; // Track characters for performance optimization
+    
+    // Optimized timing thresholds for paste detection
+    let paste_threshold = std::time::Duration::from_millis(15); // Faster detection = pasting
+    let paste_end_threshold = std::time::Duration::from_millis(100); // Reduced gap = end of paste
+    let large_paste_threshold = 5000; // Higher threshold for large paste optimization
     
     loop {
         // Optimal ratatui pattern: always draw UI first, then handle events
         // This ensures UI stays updated even when no events occur
         
         // Always redraw if processing or on input events (fixes display refresh bug)
-        let should_redraw = needs_redraw || processing_task.is_some() || status_complete_timer.is_some();
-        if should_redraw || true { // Force redraw for real-time updates
+        let now = std::time::Instant::now();
+        let should_redraw = needs_redraw 
+            || processing_task.is_some() 
+            || status_complete_timer.is_some()
+            || now.duration_since(last_render_time) > std::time::Duration::from_millis(100); // Periodic refresh
+        if should_redraw { // Only redraw when needed
             terminal.draw(|f| {
                 // Calculate dynamic input height based on content
                 let input_lines = if input_buffer.is_empty() {
@@ -980,6 +992,7 @@ pub async fn handle_chat(
             f.render_widget(status_bar, status_area);
             })?;
             needs_redraw = false;
+            last_render_time = now;
         }
         
         // --- Handle input events with shorter timeout for responsiveness ---
@@ -1178,14 +1191,21 @@ pub async fn handle_chat(
                         let now = std::time::Instant::now();
                         let time_since_last = now.duration_since(last_char_time);
                         
-                        // Detect start of paste (immediate rapid input on first character)
-                        if !is_pasting && (time_since_last < paste_threshold || (input_buffer.is_empty() && time_since_last < std::time::Duration::from_millis(5))) {
+                        // OPTIMIZED: Detect start of paste with improved performance
+                        if !is_pasting && (time_since_last < paste_threshold || (input_buffer.is_empty() && time_since_last < std::time::Duration::from_millis(3))) {
                             is_pasting = true;
                             paste_buffer.clear();
+                            paste_char_count = 0;
+                            
+                            // Reserve more capacity for large pastes
+                            if paste_buffer.capacity() < 8192 {
+                                paste_buffer.reserve(8192);
+                            }
                             
                             // If we have a previous character in input_buffer, it's part of the paste
                             if let Some(prev_char) = last_char {
                                 paste_buffer.push(prev_char);
+                                paste_char_count += 1;
                                 // Remove that character from input_buffer since it's now part of paste
                                 if !input_buffer.is_empty() {
                                     input_buffer.pop();
@@ -1195,9 +1215,17 @@ pub async fn handle_chat(
                             
                             // Add the current character that triggered paste detection
                             paste_buffer.push(c);
+                            paste_char_count += 1;
                         } else if is_pasting {
-                            // We're in paste mode - buffer all characters for line counting
+                            // OPTIMIZED: Buffer characters efficiently for large pastes
                             paste_buffer.push(c);
+                            paste_char_count += 1;
+                            
+                            // For very large pastes, only yield occasionally without forcing redraw
+                            if paste_char_count > large_paste_threshold && paste_char_count % 10000 == 0 {
+                                // Very rarely yield CPU time without UI redraw
+                                tokio::task::yield_now().await;
+                            }
                         } else {
                             // Normal character input
                             let byte_idx_to_insert = input_buffer.char_indices()
@@ -1220,9 +1248,14 @@ pub async fn handle_chat(
                 }
             }
             Event::Paste(text) => {
-                // SUCCESS! This proves bracketed paste is working
-                display_lines.push("🎉 SUCCESS! Event::Paste received!".to_string());
-                display_lines.push(format!("📋 Pasted {} bytes: '{}'", text.len(), text));
+                // Handle bracketed paste - this is the most efficient method
+                let lines = text.lines().count();
+                let bytes = text.len();
+                
+                // Show paste notification for substantial content
+                if bytes > 100 || lines > 2 {
+                    display_lines.push(format!("📋 Pasted: {} bytes, {} lines", bytes, lines));
+                }
                 
                 // Add the pasted text to input buffer at cursor position
                 let cursor_byte_pos = input_buffer.char_indices()
@@ -1235,6 +1268,11 @@ pub async fn handle_chat(
                 // Update typing status
                 PersistentStatusBar::update_typing_status();
                 needs_redraw = true;
+                
+                // Yield for very large pastes
+                if bytes > 10000 {
+                    tokio::task::yield_now().await;
+                }
             }
             // Handle ONLY scroll wheel, ignore all other mouse events for text selection
             Event::Mouse(mouse_event) => {
@@ -1268,9 +1306,10 @@ pub async fn handle_chat(
                 if !paste_buffer.is_empty() {
                     let bytes = paste_buffer.len();
                     
-                    // Count actual line breaks more accurately - handle both \r\n and \n
-                    let newline_count = paste_buffer.matches('\n').count();
-                    let carriage_return_count = paste_buffer.matches('\r').count();
+                    // OPTIMIZED: Count line breaks efficiently for large pastes
+                    // Always use fast byte-level counting for line counting
+                    let newline_count = paste_buffer.bytes().filter(|&b| b == b'\n').count();
+                    let carriage_return_count = paste_buffer.bytes().filter(|&b| b == b'\r').count();
                     
                     // If we have both \r and \n, it's likely \r\n pairs (Windows), so use \n count
                     // If we only have \r, those are the line breaks (old Mac style)
@@ -1315,9 +1354,15 @@ pub async fn handle_chat(
                     // Update typing status
                     PersistentStatusBar::update_typing_status();
                     needs_redraw = true;
+                    
+                    // Yield to prevent UI blocking after large paste processing
+                    if paste_char_count > 1000 {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 
                 paste_buffer.clear();
+                paste_char_count = 0; // Reset counter
             }
         }
 
@@ -1392,6 +1437,7 @@ pub async fn handle_chat(
                 }
                 status_complete_timer = Some(std::time::Instant::now());
                 scroll_offset = 0; // Scroll to bottom to see response
+                needs_redraw = true; // Critical: Force UI redraw after AI response completion
             }
         }
 
@@ -1487,10 +1533,19 @@ async fn process_chat_input(
         importance: crate::cli::memory::MessageImportance::Contextual,
         metadata: crate::cli::memory::MessageMetadata::default(),
     };
-    memory_engine.add_message(MessageRole::User, input).await?;
+    
+    // Convert file:/// URLs to proper file paths (Windows paste fix)
+    let processed_input = if input.contains("file:///") || input.contains("file://") {
+        let fixed = input.replace("file:///", "").replace("file://", "");
+        urlencoding::decode(&fixed).map(|s| s.to_string()).unwrap_or(fixed)
+    } else {
+        input.to_string()
+    };
+    
+    memory_engine.add_message(MessageRole::User, &processed_input).await?;
 
     // Process with unified intelligent routing
-    match process_intelligently(input, memory_engine, config).await {
+    match process_intelligently(&processed_input, memory_engine, config).await {
         Ok(response) => {
             // Add assistant response to memory
             let _assistant_msg = ChatMessage {
@@ -1527,10 +1582,13 @@ async fn process_intelligently(
     match request_type {
         RequestType::DirectAnswer => {
             PersistentStatusBar::update_status("Providing direct answer");
+            let conversation_context = memory_engine.get_context(5, 500).await.unwrap_or_default();
             let prompt = format!(
                 "You are Glimmer, a coding assistant. Answer this question in exactly 2 sentences maximum. Be direct and concise like Claude Code.\n\n\
+                Recent conversation context:\n{}\n\n\
                 Question: {}\n\n\
                 Answer (2 sentences max):",
+                conversation_context.trim(),
                 input
             );
             let response = gemini::query_gemini(&prompt, config).await?;
@@ -1540,9 +1598,12 @@ async fn process_intelligently(
         }
         
         RequestType::Research => {
-            PersistentStatusBar::update_status("Researching");
+            PersistentStatusBar::update_status("Using AI intelligence for research");
             
-            let response = research::perform_intelligent_research(input, config).await?;
+            // Direct AI research without hardcoded patterns - pure intelligence
+            let response = gemini::query_gemini(&format!(
+                "Research and provide comprehensive information about: {}\n\
+                Use your knowledge to provide detailed, accurate information.", input), config).await?;
             
             return Ok(response);
         }
@@ -2465,16 +2526,8 @@ async fn get_ai_response_with_intelligent_routing(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     
-    // Check if we should do automatic research
-    thinking.progress_thought("Research", "checking if needed");
-    let research_result = research::auto_research_if_needed(input, &conversation_context, config).await;
-    let research_context = if let Some(ref research) = research_result {
-        thinking.progress_thought("Research", &format!("found {}", research.title));
-        format!("\n\nRESEARCH FINDINGS:\nTitle: {}\nSummary: {}\nURL: {}", 
-            research.title, research.summary, research.url)
-    } else {
-        String::new()
-    };
+    // Research functionality removed - using pure AI intelligence
+    let research_context = String::new();
     
     // Create system prompt with function calling instructions
     let system_prompt = create_function_calling_prompt(&available_functions);
@@ -2738,14 +2791,8 @@ async fn get_ai_response(
     // Build an intelligent, context-aware prompt
     let enhanced_context = collect_intelligent_context(&current_dir, input).await;
     
-    // Check if we should do automatic research
-    let research_result = research::auto_research_if_needed(input, &conversation_context, config).await;
-    let research_context = if let Some(ref research) = research_result {
-        format!("\n\nRESEARCH FINDINGS:\nTitle: {}\nSummary: {}\nURL: {}", 
-            research.title, research.summary, research.url)
-    } else {
-        String::new()
-    };
+    // Research functionality removed - using pure AI intelligence
+    let research_context = String::new();
 
     let prompt = format!(
         "You are Glimmer, an intelligent coding assistant that makes smart decisions automatically.\n\
