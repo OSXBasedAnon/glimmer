@@ -7,15 +7,16 @@ use html2text;
 use crate::config::{Config};
 use crate::gemini;
 use crate::differ::{create_diff};
-use crate::progress_display::{start_analyzing, start_editing, complete_operation};
+use crate::progress_display::{start_analyzing, start_editing, complete_operation, task_completed};
 
 /// Edit strategy determined by intelligent analysis
 #[derive(Debug, Clone)]
 enum EditStrategy {
     Surgical,  // Precise, targeted edits using imara-diff
-    Chunked,   // Large file chunked editing  
+    Chunked,   // Large file chunked editing
     Direct,    // Direct full-file editing for simple cases
 }
+use ropey::Rope;
 use crate::file_io::{read_file, write_file};
 // Audio removed - keeping TrackInfo type alias for compatibility
 type TrackInfo = String;
@@ -116,11 +117,15 @@ async fn validate_edit_integrity(function_call: FunctionCall, _result: String) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         
         match tokio::fs::read_to_string(file_path).await {
-            Ok(_content) => {
-                // Validation is now AI-driven rather than rule-based
-                crate::thinking_display::PersistentStatusBar::add_reasoning_step(&format!(
-                    "File {} written successfully", file_path
-                ));
+            Ok(content) => {
+                let issues = detect_potential_issues(&content, file_path);
+                if !issues.is_empty() {
+                    crate::thinking_display::PersistentStatusBar::add_reasoning_step(&format!(
+                        "VALIDATION_WARNING: {} may have issues: {}", 
+                        file_path, 
+                        issues.join(", ")
+                    ));
+                }
             },
             Err(e) => {
                 crate::thinking_display::PersistentStatusBar::add_reasoning_step(&format!(
@@ -131,163 +136,63 @@ async fn validate_edit_integrity(function_call: FunctionCall, _result: String) {
     }
 }
 
-
-/// Check if content has a built-in TWEEN implementation
-fn has_builtin_tween_implementation(content: &str) -> bool {
-    content.contains("var TWEEN = TWEEN ||") || 
-    content.contains("const TWEEN =") ||
-    content.contains("TWEEN = {") ||
-    content.contains("function TWEEN(") ||
-    content.contains("class TWEEN")
-}
-
-/// Validate basic HTML structure for common issues
-fn validate_html_structure(content: &str) -> bool {
-    let mut tag_stack = Vec::new();
-    let mut in_tag = false;
-    let mut current_tag = String::new();
+/// Detect common issues that could break functionality
+fn detect_potential_issues(content: &str, file_path: &str) -> Vec<String> {
+    let mut issues = Vec::new();
     
-    // Simple validation - check for basic tag matching
-    for ch in content.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                current_tag.clear();
-            },
-            '>' => {
-                if in_tag {
-                    in_tag = false;
-                    let tag = current_tag.trim();
-                    
-                    // Skip self-closing tags and special tags
-                    if tag.ends_with('/') || tag.starts_with('!') || tag.starts_with('?') {
-                        continue;
-                    }
-                    
-                    // Check for closing tag
-                    if tag.starts_with('/') {
-                        let closing_tag = &tag[1..];
-                        if let Some(opening_tag) = tag_stack.pop() {
-                            if opening_tag != closing_tag {
-                                return false; // Mismatched tags
+    let extension = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    
+    match extension {
+        "html" | "htm" => {
+            // Check for actual structural issues, not implementation choices
+            if content.contains("<script") && content.contains("src=") && !content.contains("defer") && !content.contains("async") {
+                // Only warn about potentially blocking scripts, not missing canvas
+            }
+            if content.contains("<script") && content.contains("src=") {
+                // Extract script src and check if files exist
+                for line in content.lines() {
+                    if line.contains("<script") && line.contains("src=") {
+                        if let Some(src) = extract_script_src(line) {
+                            let script_path = if src.starts_with("./") {
+                                src.strip_prefix("./").unwrap_or(&src)
+                            } else {
+                                &src
+                            };
+                            
+                            let full_path = std::path::Path::new(file_path)
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."))
+                                .join(script_path);
+                                
+                            if !full_path.exists() {
+                                issues.push(format!("Referenced script '{}' not found", src));
                             }
-                        } else {
-                            return false; // Closing tag without opening
-                        }
-                    } else {
-                        // Skip self-closing HTML tags
-                        let self_closing = ["img", "br", "hr", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"];
-                        let tag_name = tag.split_whitespace().next().unwrap_or("");
-                        if !self_closing.contains(&tag_name) {
-                            tag_stack.push(tag_name.to_string());
                         }
                     }
                 }
-            },
-            _ => {
-                if in_tag {
-                    current_tag.push(ch);
-                }
             }
-        }
+        },
+        "js" => {
+            // Check for common JavaScript issues
+            if content.contains("getElementById") && !content.contains("null") && !content.contains("querySelector") {
+                // Only flag if no modern DOM methods are used
+                issues.push("JavaScript uses getElementById without null checks".to_string());
+            }
+            // Remove the cube/canvas check - DOM-based cubes are valid
+        },
+        "css" => {
+            // Check for CSS issues
+            if content.contains("canvas") && !content.contains("display") {
+                issues.push("CSS for canvas without display properties".to_string());
+            }
+        },
+        _ => {}
     }
     
-    // All tags should be closed
-    tag_stack.is_empty()
-}
-
-
-
-/// Simple response validation - extract code from markdown blocks if present
-fn validate_ai_response(ai_response: &str, _original_content: &str) -> Result<String> {
-    // Only handle obvious markdown code blocks - no language-specific patterns
-    if ai_response.contains("```") {
-        let mut in_code = false;
-        let mut code_lines = Vec::new();
-        
-        for line in ai_response.lines() {
-            if line.trim().starts_with("```") {
-                in_code = !in_code;
-                continue;
-            }
-            if in_code {
-                code_lines.push(line);
-            }
-        }
-        
-        if !code_lines.is_empty() {
-            return Ok(code_lines.join("\n"));
-        }
-    }
-    
-    // Otherwise return as-is - trust the prompting strategy
-    Ok(ai_response.to_string())
-}
-
-/// AI-driven context analysis result
-#[derive(Debug, Clone)]
-struct ContextAnalysis {
-    requires_rewrite: bool,
-    deployment_guidance: String,
-    issues: Vec<String>,
-}
-
-/// AI-driven analysis that actually works reliably
-async fn analyze_context_with_ai(content: &str, file_path: &str, query: &str, config: &Config) -> Result<ContextAnalysis> {
-    let analysis_prompt = format!(
-        "You are analyzing a code editing request. Be precise and practical.\n\nFile: {}\nUser request: {}\nCode length: {} characters\n\nFirst 500 characters of code:\n{}\n\nAnswer these questions with brief, practical responses:\n\n1. Does this code have critical issues that prevent it from working?\n2. What specific technical problems exist?\n3. How should this file be deployed/used?\n4. Should this be a complete rewrite or small edit?\n\nProvide your analysis in this exact format:\nREQUIRES_REWRITE: yes/no\nISSUES: comma-separated list\nDEPLOYMENT: brief guidance\nEND_ANALYSIS",
-        file_path, 
-        query, 
-        content.len(),
-        content.chars().take(500).collect::<String>()
-    );
-    
-    let response = crate::gemini::query_gemini_fast(&analysis_prompt, config).await?;
-    
-    // Parse structured response
-    let requires_rewrite = response.to_lowercase().contains("requires_rewrite: yes");
-    
-    let issues = if let Some(issues_line) = response.lines().find(|line| line.starts_with("ISSUES:")) {
-        issues_line.strip_prefix("ISSUES:").unwrap_or("").trim()
-            .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-    } else { vec![] };
-    
-    let deployment_guidance = if let Some(deploy_line) = response.lines().find(|line| line.starts_with("DEPLOYMENT:")) {
-        deploy_line.strip_prefix("DEPLOYMENT:").unwrap_or("Use best practices").trim().to_string()
-    } else { "Use best practices for the context".to_string() };
-    
-    Ok(ContextAnalysis {
-        requires_rewrite,
-        deployment_guidance,
-        issues,
-    })
-}
-
-/// Determine if we need expensive AI analysis or can handle simply
-fn should_analyze_context(content: &str, query: &str) -> bool {
-    let query_lower = query.to_lowercase();
-    
-    // Run analysis if:
-    // 1. User mentions issues/problems
-    let has_problem_keywords = query_lower.contains("fix") || 
-                              query_lower.contains("not working") || 
-                              query_lower.contains("broken") ||
-                              query_lower.contains("blank") ||
-                              query_lower.contains("error");
-    
-    // 2. Content has potential technical issues
-    let has_technical_issues = content.contains("import ") || 
-                              content.contains("type=\"module\"") ||
-                              content.len() < 50 || // Very short/empty files
-                              content.contains("undefined") ||
-                              content.contains("error");
-    
-    // 3. Complex operations
-    let is_complex_operation = query_lower.contains("rewrite") ||
-                              query_lower.contains("completely") ||
-                              query_lower.contains("rebuild");
-    
-    has_problem_keywords || has_technical_issues || is_complex_operation
+    issues
 }
 
 /// Extract script src attribute from HTML line
@@ -595,7 +500,7 @@ pub async fn execute_function_call(
             "fetch_url" => execute_fetch_url(function_call).await,
             "diff_files" => execute_diff_files(function_call).await,
             "code_analysis" => execute_code_analysis(function_call, config, conversation_history).await,
-            "edit_code" => execute_edit_code(function_call, config).await,
+            "edit_code" => execute_edit_code_with_recovery(function_call, config, conversation_history).await,
             _ => Err(anyhow!("Unknown function: {}", function_call.name)),
         };
         
@@ -605,9 +510,8 @@ pub async fn execute_function_call(
                 if let Some(op_id) = &operation_id {
                     let completion_msg = match function_call.name.as_str() {
                         "edit_code" => {
-                            // Use the actual function result as the completion message
-                            // This ensures the indicator connects to the right message
-                            success_result.clone()
+                            // Validate the edit and provide specific feedback
+                            validate_edit_completion(function_call, &success_result).await
                         },
                         "code_analysis" => "Code analysis completed successfully".to_string(), 
                         _ => "Operation completed".to_string()
@@ -651,10 +555,8 @@ pub fn create_function_calling_prompt(functions: &[FunctionDefinition]) -> Strin
     let mut prompt = String::from("You are an AI assistant with access to these functions:\n\n");
     
     for function in functions {
-        prompt.push_str(&format!("Function: {}
-", function.name));
-        prompt.push_str(&format!("Description: {}
-", function.description));
+        prompt.push_str(&format!("Function: {}\n", function.name));
+        prompt.push_str(&format!("Description: {}\n", function.description));
         prompt.push_str("Parameters:\n");
         
         for param in &function.parameters {
@@ -669,12 +571,10 @@ pub fn create_function_calling_prompt(functions: &[FunctionDefinition]) -> Strin
     prompt.push_str("\nWhen you need to use a function, respond with JSON in this format:\n");
     prompt.push_str("{\n  \"function_call\": {\n    \"name\": \"function_name\",\n    \"arguments\": {\n      \"parameter_name\": \"value\"\n    }\n  },\n  \"reasoning\": \"Brief explanation of why you're calling this function\"\n}\n\n");
     prompt.push_str("EXAMPLES:\n");
-    prompt.push_str("edit_code: {\"function_call\": {\"name\": \"edit_code\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"fix the JavaScript errors\"}}}
-");
+    prompt.push_str("edit_code: {\"function_call\": {\"name\": \"edit_code\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"fix the JavaScript errors\"}}}\n");
     prompt.push_str("read_file: {\"function_call\": {\"name\": \"read_file\", \"arguments\": {\"file_path\": \"index.html\"}}} // ONLY when user asks to view/see file\n");
-    prompt.push_str("list_directory: {\"function_call\": {\"name\": \"list_directory\", \"arguments\": {\"directory_path\": \"C:\\\\Users\\\\Admin\\\\Desktop\\\\random\"}}}
-");
-    prompt.push_str("\nCRITICAL FUNCTION USAGE RULES:\n");
+    prompt.push_str("list_directory: {\"function_call\": {\"name\": \"list_directory\", \"arguments\": {\"directory_path\": \"C:\\\\Users\\\\Admin\\\\Desktop\\\\random\"}}}\n\n");
+    prompt.push_str("CRITICAL FUNCTION USAGE RULES:\n");
     prompt.push_str("- User says 'what is in [folder]' → USE list_directory with full path\n");
     prompt.push_str("- User says 'show me/read/view [file]' → USE read_file\n");
     prompt.push_str("- User says 'fix/improve/edit [file]' → For simple fixes: edit_code directly. For complex fixes: code_analysis then edit_code\n");
@@ -776,8 +676,7 @@ pub fn create_dynamic_function_calling_prompt(functions: &[FunctionDefinition], 
     if !context.success_patterns.is_empty() {
         prompt.push_str("PROVEN SUCCESSFUL APPROACHES:\n");
         for pattern in &context.success_patterns {
-            prompt.push_str(&format!("- {}
-", pattern));
+            prompt.push_str(&format!("- {}\n", pattern));
         }
         prompt.push('\n');
     }
@@ -785,10 +684,8 @@ pub fn create_dynamic_function_calling_prompt(functions: &[FunctionDefinition], 
     prompt.push_str("Available functions:\n\n");
     
     for function in functions {
-        prompt.push_str(&format!("Function: {}
-", function.name));
-        prompt.push_str(&format!("Description: {}
-", function.description));
+        prompt.push_str(&format!("Function: {}\n", function.name));
+        prompt.push_str(&format!("Description: {}\n", function.description));
         prompt.push_str("Parameters:\n");
         
         for param in &function.parameters {
@@ -807,24 +704,18 @@ pub fn create_dynamic_function_calling_prompt(functions: &[FunctionDefinition], 
     match context.task_type {
         TaskType::Reading | TaskType::Analysis => {
             prompt.push_str("EXAMPLES FOR ANALYSIS:\n");
-            prompt.push_str("read_file: {\"function_call\": {\"name\": \"read_file\", \"arguments\": {\"file_path\": \"index.html\"}}}
-");
-            prompt.push_str("code_analysis: {\"function_call\": {\"name\": \"code_analysis\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"analyze performance bottlenecks\"}}}
-");
+            prompt.push_str("read_file: {\"function_call\": {\"name\": \"read_file\", \"arguments\": {\"file_path\": \"index.html\"}}}\n");
+            prompt.push_str("code_analysis: {\"function_call\": {\"name\": \"code_analysis\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"analyze performance bottlenecks\"}}}\n");
         },
         TaskType::Editing | TaskType::Debugging => {
             prompt.push_str("EXAMPLES FOR EDITING:\n");
-            prompt.push_str("edit_code: {\"function_call\": {\"name\": \"edit_code\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"fix the JavaScript errors\"}}}
-");
-            prompt.push_str("code_analysis: {\"function_call\": {\"name\": \"code_analysis\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"identify the cause of runtime errors\"}}}
-");
+            prompt.push_str("edit_code: {\"function_call\": {\"name\": \"edit_code\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"fix the JavaScript errors\"}}}\n");
+            prompt.push_str("code_analysis: {\"function_call\": {\"name\": \"code_analysis\", \"arguments\": {\"file_path\": \"script.js\", \"query\": \"identify the cause of runtime errors\"}}}\n");
         },
         TaskType::Creating => {
             prompt.push_str("EXAMPLES FOR CREATION:\n");
-            prompt.push_str("write_file: {\"function_call\": {\"name\": \"write_file\", \"arguments\": {\"file_path\": \"new_component.js\", \"content\": \"// New component code\"}}}
-");
-            prompt.push_str("list_directory: {\"function_call\": {\"name\": \"list_directory\", \"arguments\": {\"directory_path\": \"C:\\\\Users\\\\Admin\\\\Desktop\\\\project\"}}}
-");
+            prompt.push_str("write_file: {\"function_call\": {\"name\": \"write_file\", \"arguments\": {\"file_path\": \"new_component.js\", \"content\": \"// New component code\"}}}\n");
+            prompt.push_str("list_directory: {\"function_call\": {\"name\": \"list_directory\", \"arguments\": {\"directory_path\": \"C:\\\\Users\\\\Admin\\\\Desktop\\\\project\"}}}\n");
         },
     }
     
@@ -835,13 +726,6 @@ pub fn create_dynamic_function_calling_prompt(functions: &[FunctionDefinition], 
     prompt.push_str("- NEVER call read_file before editing - edit_code reads the file automatically\n");
     prompt.push_str("- Complex fixes (missing functions, major features): code_analysis → edit_code\n");
     prompt.push_str("- Simple fixes (typos, small changes): edit_code directly\n\n");
-    
-    prompt.push_str("YOU ARE A COMPREHENSIVE CODING ASSISTANT:\n");
-    prompt.push_str("- Directory analysis: Use list_directory to explore any directory, then read_file/code_analysis on files\n");
-    prompt.push_str("- Code auditing: Systematically examine codebases by listing contents, reading key files, analyzing patterns\n");
-    prompt.push_str("- Multi-file operations: Handle complex projects spanning multiple files and directories\n");
-    prompt.push_str("- Advanced tooling: You have imara-diff, search capabilities, and complete file system access\n");
-    prompt.push_str("- When given a directory path: START with list_directory to understand the structure\n\n");
     
     prompt.push_str("PROACTIVE CONTEXT ANALYSIS:\n");
     prompt.push_str("- When user provides a file path for editing/fixing: Use code_analysis for complex issues, edit_code for simple ones\n");
@@ -886,8 +770,18 @@ async fn execute_read_file(function_call: &FunctionCall) -> Result<String> {
     
     crate::thinking_display::PersistentStatusBar::add_reasoning_step(&format!("Looking for file: {}", file_path));
     
-    // Use the provided file path directly (post-refactor: rely on intelligence rather than pattern matching)
-    let actual_path = file_path.to_string();
+    // Use existing smart file discovery from chat.rs
+    let actual_path = if Path::new(file_path).exists() {
+        file_path.to_string()
+    } else {
+        crate::thinking_display::PersistentStatusBar::add_reasoning_step("File not found, searching similar files");
+        // Use the existing smart_file_discovery function
+        use crate::cli::chat::smart_file_discovery;
+        use crate::config::Config;
+        let default_config = Config::default();
+        smart_file_discovery(file_path, &default_config).await
+            .unwrap_or_else(|| file_path.to_string())
+    };
     
     let content = read_file(Path::new(&actual_path)).await?;
     
@@ -915,184 +809,6 @@ async fn execute_write_file(function_call: &FunctionCall) -> Result<String> {
     
     write_file(Path::new(file_path), content).await?;
     Ok(format!("Successfully wrote {} bytes to '{}'", content.len(), file_path))
-}
-
-async fn execute_edit_code(function_call: &FunctionCall, config: &Config) -> Result<String> {
-    // Use the comprehensive editing system with recovery and strategy selection
-    execute_edit_code_with_recovery(function_call, config, "").await
-}
-
-/// Comprehensive edit system with surgical editing, recovery, and intelligent strategy selection
-async fn execute_edit_code_with_recovery(
-    function_call: &FunctionCall,
-    config: &Config,
-    _conversation_history: &str
-) -> Result<String> {
-    let file_path = function_call.arguments.get("file_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing file_path parameter"))?;
-    
-    let query = function_call.arguments.get("query")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing query parameter"))?;
-    
-    // Read current file content
-    let current_content = read_file(Path::new(file_path)).await?;
-    
-    // Use intelligent strategy selection (no AI calls - fast heuristics)
-    let edit_strategy = select_edit_strategy_fast(query, &current_content);
-    
-    let new_content = match edit_strategy {
-        EditStrategy::Surgical => {
-            // Use surgical editing for precise, targeted changes with imara-diff
-            crate::thinking_display::PersistentStatusBar::add_reasoning_step("Strategy: Surgical editing with imara-diff");
-            // Always use surgical editing - no fallback to broken rope processor
-            execute_surgical_edit(file_path, &current_content, query, config).await?
-        },
-        EditStrategy::Chunked => {
-            // Use chunked editing for large files
-            crate::thinking_display::PersistentStatusBar::add_reasoning_step("Strategy: Large file chunked editing");
-            execute_large_file_edit(file_path, &current_content, query, config).await?
-        },
-        EditStrategy::Direct => {
-            // Use simple direct editing
-            crate::thinking_display::PersistentStatusBar::add_reasoning_step("Strategy: Direct editing");
-            execute_simple_edit(file_path, &current_content, query, config).await?
-        }
-    };
-    
-    // Validate and write the result
-    let validated_content = validate_ai_response(&new_content, &current_content)?;
-    write_file(Path::new(file_path), &validated_content).await?;
-    
-    let changes = estimate_changes(&current_content, &validated_content);
-    Ok(format!("Successfully edited '{}' with {} changes using {} strategy", 
-               file_path, changes, strategy_name(&edit_strategy)))
-}
-
-
-/// Fast strategy selection using heuristics (no AI calls)
-fn select_edit_strategy_fast(query: &str, content: &str) -> EditStrategy {
-    let query_lower = query.to_lowercase();
-    let content_size = content.len();
-    let line_count = content.lines().count();
-    
-    // Large file strategy
-    if content_size > 50_000 || line_count > 1000 {
-        return EditStrategy::Chunked;
-    }
-    
-    // Check for surgical edit indicators
-    let surgical_indicators = ["fix", "change", "replace", "update", "modify"];
-    let has_surgical = surgical_indicators.iter().any(|&indicator| query_lower.contains(indicator));
-    
-    // Small, targeted changes should use surgical editing
-    if has_surgical && content_size < 20_000 {
-        EditStrategy::Surgical
-    } else {
-        EditStrategy::Direct
-    }
-}
-
-fn strategy_name(strategy: &EditStrategy) -> &'static str {
-    match strategy {
-        EditStrategy::Surgical => "surgical",
-        EditStrategy::Chunked => "chunked", 
-        EditStrategy::Direct => "direct",
-    }
-}
-
-/// Execute surgical editing using imara-diff for precise change injection
-async fn execute_surgical_edit(file_path: &str, content: &str, query: &str, config: &Config) -> Result<String> {
-    crate::thinking_display::PersistentStatusBar::add_reasoning_step("Using Surgical Editor with imara-diff");
-    
-    // Create focused prompt for surgical edit with file-type awareness
-    let file_extension = std::path::Path::new(file_path).extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("txt");
-        
-    let surgical_prompt = match file_extension {
-        "html" | "htm" => format!(
-            "You are a web developer making a surgical edit to this HTML file.
-
-Task: {}
-
-Current HTML file:
-{}
-
-IMPORTANT: Return the COMPLETE updated HTML file. Make precise changes while maintaining functionality.",
-            query, content
-        ),
-        _ => format!(
-            "SURGICAL EDIT: Make only the specific change requested.
-
-Task: {}
-
-Current file content:
-{}
-
-Return the COMPLETE updated file content with NO markdown formatting. Make precise, surgical changes only.",
-            query, content
-        )
-    };
-    
-    let edited_content = crate::gemini::query_gemini(&surgical_prompt, config).await?;
-    
-    // Use imara-diff for validation and refinement if available
-    if let Ok(diff_result) = apply_surgical_diff(content, &edited_content, file_path) {
-        Ok(diff_result)
-    } else {
-        Ok(edited_content)
-    }
-}
-
-/// Execute large file editing with chunked processing
-async fn execute_large_file_edit(file_path: &str, content: &str, query: &str, config: &Config) -> Result<String> {
-    crate::thinking_display::PersistentStatusBar::add_reasoning_step("Using chunked editing for large file");
-    
-    // Use the existing rope-based processor
-    process_large_file_with_rope(file_path, content, query, config).await
-}
-
-/// Execute simple direct editing
-async fn execute_simple_edit(file_path: &str, _content: &str, query: &str, config: &Config) -> Result<String> {
-    crate::thinking_display::PersistentStatusBar::add_reasoning_step("Using CLEAN direct editing pipeline");
-    
-    // Detect file type for better prompting
-    let file_extension = Path::new(file_path).extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("txt");
-    
-    // Universal prompt that works for ANY file type
-    let clean_prompt = format!(
-        "Create a complete {} file: {}
-
-CRITICAL INSTRUCTIONS:
-- Respond with ONLY the raw file content
-- NO markdown code blocks (no ```, no ```{}, no explanations)
-- Start immediately with the actual file content
-- Make it complete and functional
-- Do not include any commentary or descriptions
-
-Generate the complete file content now:",
-        file_extension, query, file_extension
-    );
-    
-    // Show thinking display for user experience
-    crate::thinking_display::PersistentStatusBar::set_ai_thinking("Generating fresh code without analyzing existing content");
-    
-    // Use the CLEAN Gemini query without any thinking/reasoning extraction
-    let result = crate::gemini::query_gemini_clean(&clean_prompt, config).await?;
-    
-    // For clean editing, return raw result without any markdown processing
-    Ok(result)
-}
-
-/// Apply surgical diff using imara-diff if available
-fn apply_surgical_diff(_original: &str, edited: &str, _file_path: &str) -> Result<String> {
-    // For now, just return the edited content
-    // TODO: Integrate with imara-diff for precise surgical editing
-    Ok(edited.to_string())
 }
 
 async fn execute_rename_file(function_call: &FunctionCall) -> Result<String> {
@@ -1360,6 +1076,73 @@ fn is_debug_line(line: &str) -> bool {
     false
 }
 
+/// Extract search keywords from user query (like Claude Code does)
+fn extract_search_keywords_from_query(query: &str) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let query_lower = query.to_lowercase();
+    
+    // Direct platform mentions
+    if query_lower.contains("android") {
+        keywords.push("android".to_string());
+        keywords.push("blink".to_string()); // Android often uses Blink rendering
+    }
+    if query_lower.contains("ios") {
+        keywords.push("ios".to_string());
+        keywords.push("webkit".to_string());
+        keywords.push("safari".to_string());
+    }
+    
+    // Debug/logging keywords
+    if query_lower.contains("debug") || query_lower.contains("debugging") {
+        keywords.push("debug".to_string());
+        keywords.push("console.log".to_string());
+        keywords.push("console.error".to_string());
+    }
+    if query_lower.contains("console") || query_lower.contains("log") {
+        keywords.push("console".to_string());
+        keywords.push("log".to_string());
+    }
+    
+    // Development keywords
+    if query_lower.contains("testing") || query_lower.contains("test") {
+        keywords.push("test".to_string());
+        keywords.push("testing".to_string());
+    }
+    if query_lower.contains("development") || query_lower.contains("dev") {
+        keywords.push("dev".to_string());
+        keywords.push("development".to_string());
+    }
+    
+    // Specific code patterns mentioned in query
+    if query_lower.contains("blinkrenderingfixes") {
+        keywords.push("BlinkRenderingFixes".to_string());
+    }
+    if query_lower.contains("rendering") {
+        keywords.push("rendering".to_string());
+        keywords.push("render".to_string());
+    }
+    if query_lower.contains("fixes") || query_lower.contains("fix") {
+        keywords.push("fixes".to_string());
+        keywords.push("fix".to_string());
+    }
+    
+    // Remove duplicates and return
+    keywords.sort();
+    keywords.dedup();
+    
+    // If no specific keywords found, try to extract important words
+    if keywords.is_empty() {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        for word in words {
+            let word_clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if word_clean.len() > 3 { // Only include substantial words
+                keywords.push(word_clean.to_string());
+            }
+        }
+    }
+    
+    keywords
+}
 
 /// Check if line matches platform-specific debugging patterns
 fn matches_platform_debugging(line: &str, keyword: &str) -> bool {
@@ -1611,7 +1394,24 @@ fn create_intelligent_edit_prompt(query: &str, content: &str, start_line: usize,
     };
     
     format!(
-        r"IMPORTANT: You are removing {} from this JavaScript/HTML file.\n\nTASK: Remove ALL related code completely - not just individual lines.\nThis includes:\n- Complete if/else blocks\n- Entire function definitions\n- Full object definitions\n- Associated comments and dividers\n- Any incomplete fragments\n\nFOCUS AREA: Lines {}-{} contain the main target code.\nCONTEXT: Lines {}-{} (you must return this entire section, edited)\n\nCRITICAL: \n- Do NOT leave partial code fragments\n- Do NOT leave orphaned variables or references\n- Do NOT break JavaScript syntax\n- Remove complete logical blocks, not individual scattered lines\n\nOriginal request: {}\n\nCode section to edit:\n{}\n\nProvide the complete edited section with {} fully removed:",
+        "IMPORTANT: You are removing {} from this JavaScript/HTML file.\n\n\
+        TASK: Remove ALL related code completely - not just individual lines.\n\
+        This includes:\n\
+        - Complete if/else blocks\n\
+        - Entire function definitions\n\
+        - Full object definitions\n\
+        - Associated comments and dividers\n\
+        - Any incomplete fragments\n\n\
+        FOCUS AREA: Lines {}-{} contain the main target code.\n\
+        CONTEXT: Lines {}-{} (you must return this entire section, edited)\n\n\
+        CRITICAL: \n\
+        - Do NOT leave partial code fragments\n\
+        - Do NOT leave orphaned variables or references\n\
+        - Do NOT break JavaScript syntax\n\
+        - Remove complete logical blocks, not individual scattered lines\n\n\
+        Original request: {}\n\n\
+        Code section to edit:\n{}\n\n\
+        Provide the complete edited section with {} fully removed:",
         removal_type, focus_start, focus_end, start_line, end_line, query, content, removal_type
     )
 }
@@ -1669,7 +1469,14 @@ async fn get_diff_patch_for_chunk(content: &str, query: &str, chunk: &Processing
     let section_content = lines[chunk.start_line..chunk.end_line].join("\n");
     
     let diff_prompt = format!(
-        "Analyze this code section and provide ONLY a unified diff patch to remove {}:\n\nCode section (lines {}-{}):\n{}\n\nCRITICAL: Return ONLY the unified diff patch in this exact format:\n@@ -start,count +start,count @@\n-removed line\n+added line\n\nIf no changes needed, return: NO_CHANGES_NEEDED",
+        "Analyze this code section and provide ONLY a unified diff patch to remove {}:\n\
+        \nCode section (lines {}-{}):\n{}\n\n\
+        CRITICAL: Return ONLY the unified diff patch in this exact format:\n\
+        @@ -start,count +start,count @@\n\
+        -removed line\n\
+        +added line\n\
+        \n\
+        If no changes needed, return: NO_CHANGES_NEEDED",
         query, chunk.start_line + 1, chunk.end_line + 1, section_content
     );
     
@@ -1779,7 +1586,14 @@ async fn process_focused_section(content: &str, query: &str, start_line: usize, 
     
     // REVOLUTIONARY: Ask for diff patch instead of full content
     let diff_prompt = format!(
-        "Analyze this code section and provide ONLY a unified diff patch to remove {}:\n\nCode section (lines {}-{}):\n{}\n\nCRITICAL: Return ONLY the unified diff patch in this exact format:\n@@ -start,count +start,count @@\n-removed line\n+added line\n\nIf no changes needed, return: NO_CHANGES_NEEDED",
+        "Analyze this code section and provide ONLY a unified diff patch to remove {}:\n\
+        \nCode section (lines {}-{}):\n{}\n\n\
+        CRITICAL: Return ONLY the unified diff patch in this exact format:\n\
+        @@ -start,count +start,count @@\n\
+        -removed line\n\
+        +added line\n\
+        \n\
+        If no changes needed, return: NO_CHANGES_NEEDED",
         query, start_line + 1, end_line + 1, section_content
     );
     
@@ -1888,29 +1702,122 @@ fn estimate_changes(old_content: &str, new_content: &str) -> usize {
     }
 }
 
-/// Claude Code-level intelligent large file editor with surgical precision
-/// Uses advanced AI reasoning to understand context and make precise edits
-async fn process_large_file_with_rope(_file_path_str: &str, content: &str, query: &str, config: &Config) -> Result<String> {
-    // Step 1: Use AI to understand the edit intent and locate relevant sections
-    let analysis_prompt = format!(
-        "Analyze this edit request for a large file and identify the specific sections that need modification.
+/// High-performance large file editor using a Rope data structure.
+/// This avoids panics and O(n^2) complexity by not re-parsing the file after each edit.
+async fn process_large_file_with_rope(file_path_str: &str, content: &str, query: &str, config: &Config) -> Result<String> {
+    // 1. Load the content into a Rope once.
+    let mut rope = Rope::from_str(content);
+    
+    let search_keywords = extract_search_keywords_from_query(query);
+    if search_keywords.is_empty() {
+        return Err(anyhow!("Could not determine what to search for in query: '{}'", query));
+    }
 
-Edit request: {}
+    // 2. Find all matches and their character offsets from the original rope.
+    let mut matches_with_char_offsets = Vec::new();
+    for (line_idx, line) in rope.lines().enumerate() {
+        let line_content = line.to_string();
+        for keyword in &search_keywords {
+            if line_content.to_lowercase().contains(&keyword.to_lowercase()) {
+                let line_start_char = rope.line_to_char(line_idx);
+                matches_with_char_offsets.push((line_start_char, keyword.clone()));
+            }
+        }
+    }
 
-File content:
-{}
+    if matches_with_char_offsets.is_empty() {
+        return Ok(content.to_string()); // No changes needed.
+    }
 
-Provide a structured analysis:
-1. What exactly needs to be changed?
-2. Which sections of the file are relevant?
-3. What should be preserved unchanged?
+    // 3. Define chunks based on line numbers initially, then convert to char offsets.
+    let total_lines = rope.len_lines();
+    let num_chunks = 4;
+    let chunk_size_lines = (total_lines + num_chunks - 1) / num_chunks;
+    
+    let mut chunks: Vec<(usize, usize)> = Vec::new(); // (start_char, end_char)
+    for i in 0..num_chunks {
+        let start_line = i * chunk_size_lines;
+        if start_line >= total_lines { break; }
+        let end_line = ((i + 1) * chunk_size_lines).min(total_lines);
+        
+        let start_char = rope.line_to_char(start_line);
+        let end_char = if end_line < total_lines {
+            rope.line_to_char(end_line)
+        } else {
+            rope.len_chars()
+        };
+        chunks.push((start_char, end_char));
+    }
 
-Return your analysis followed by the COMPLETE edited file content with NO markdown formatting.",
-        query, content
-    );
+    // 4. This offset tracks the total change in character count from previous edits.
+    let mut cumulative_char_offset: isize = 0;
 
-    // Step 2: Get intelligent AI analysis and editing
-    crate::gemini::query_gemini(&analysis_prompt, config).await
+    for (chunk_idx, chunk_def) in chunks.iter().enumerate() {
+        // 5. Apply the cumulative offset to find the chunk's *current* position.
+        let current_start_char = (chunk_def.0 as isize + cumulative_char_offset) as usize;
+        let mut current_end_char = (chunk_def.1 as isize + cumulative_char_offset) as usize;
+
+        // Ensure the slice range is still valid.
+        if current_start_char >= rope.len_chars() {
+            continue; 
+        }
+        current_end_char = current_end_char.min(rope.len_chars());
+        if current_start_char >= current_end_char {
+            continue;
+        }
+
+        // Check if this chunk contains any matches by comparing against original offsets.
+        let has_match_in_chunk = matches_with_char_offsets.iter().any(|&(char_offset, _)| {
+            char_offset >= chunk_def.0 && char_offset < chunk_def.1
+        });
+
+        if !has_match_in_chunk {
+            crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("Section {}/4: no matches - skipping", chunk_idx + 1));
+            continue;
+        }
+        
+        crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("Section {}/4: processing...", chunk_idx + 1));
+
+        let chunk_slice = rope.slice(current_start_char..current_end_char);
+        let chunk_content = chunk_slice.to_string();
+
+        let edit_prompt = format!(
+            "You are an expert programmer editing a section of a large file: '{}'.\n\
+            Your task is to: {}.\n\n\
+            IMPORTANT INSTRUCTIONS:\n\
+            - Write clean, readable, and high-quality code.\n\
+            - Follow the existing code style and patterns.\n\
+            - Ensure the edited code is complete, functional, and syntactically correct.\n\
+            - Keep all non-target functionality in the section intact.\n\n\
+            SECTION TO EDIT:\n```\n{}\n```\n\n\
+            Return ONLY the complete, edited section of the code. Do not add explanations or markdown formatting.",
+            file_path_str, query, chunk_content
+        );
+
+        let edited_section = match crate::gemini::query_gemini(&edit_prompt, config).await {
+            Ok(edited) => edited,
+            Err(e) => {
+                crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("Section {}/4 failed: {}", chunk_idx + 1, e));
+                continue; // Skip this chunk on error.
+            }
+        };
+
+        let original_len = current_end_char - current_start_char;
+        let new_len = edited_section.chars().count();
+
+        // 6. Perform the edit on the rope. This is very fast!
+        rope.remove(current_start_char..current_end_char);
+        rope.insert(current_start_char, &edited_section);
+
+        // 7. Calculate the delta from this specific edit and update the cumulative offset.
+        let delta = new_len as isize - original_len as isize;
+        cumulative_char_offset += delta;
+        
+        crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("Section {}/4 processed", chunk_idx + 1));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    
+    Ok(rope.to_string())
 }
 
 /// Process a large section of the file (OBSOLETE - replaced by Rope implementation)
@@ -1920,7 +1827,13 @@ async fn process_large_section_legacy(content: &str, query: &str, start_line: us
     
     // Use a focused prompt for large section processing
     let edit_prompt = format!(
-        "Remove all {} from this large code section.\n\nInstructions:\n- Remove complete blocks, functions, and structures\n- Maintain valid JavaScript/HTML syntax\n- Keep all non-target functionality intact\n\nSection to process (lines {}-{}):\n{}\n\nReturn the complete section with all {} removed:",
+        "Remove all {} from this large code section.\n\n\
+        Instructions:\n\
+        - Remove complete blocks, functions, and structures\n\
+        - Maintain valid JavaScript/HTML syntax\n\
+        - Keep all non-target functionality intact\n\n\
+        Section to process (lines {}-{}):\n{}\n\n\
+        Return the complete section with all {} removed:",
         query, start_line + 1, end_line + 1, section_content, query
     );
     
@@ -2021,7 +1934,14 @@ async fn execute_code_analysis(
     // Create focused analysis prompt based on user's request context
     let user_request = conversation_history.lines().last().unwrap_or("analyze the code");
     let analysis_prompt = format!(
-        "USER REQUEST: {}\n\nQuickly analyze this {} file '{}' to identify what's wrong or missing for the user's request.\nFocus ONLY on the specific issue mentioned. Provide a brief, targeted analysis:\n- What is the specific problem?\n- What code is missing or broken?\n- What needs to be added/fixed?\n\nKeep it concise and actionable.\n\nCode content:\n{}",
+        "USER REQUEST: {}\n\n\
+        Quickly analyze this {} file '{}' to identify what's wrong or missing for the user's request.\n\
+        Focus ONLY on the specific issue mentioned. Provide a brief, targeted analysis:\n\
+        - What is the specific problem?\n\
+        - What code is missing or broken?\n\
+        - What needs to be added/fixed?\n\n\
+        Keep it concise and actionable.\n\n\
+        Code content:\n{}",
         user_request, file_extension, file_path, content
     );
     
@@ -2043,18 +1963,974 @@ async fn execute_structured_code_analysis(
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
-
+    
     let structured_prompt = format!(
-        "Analyze this {} file and return a JSON response with structured analysis.\n\nUSER REQUEST: {}\nCONVERSATION CONTEXT: {}\n\nPlease analyze the code and return ONLY a valid JSON object with this structure:\n{{\n  \"file_info\": {{\n    \"path\": \"{}\",\n    \"language\": \"{}\",\n    \"lines_of_code\": {},\n    \"size_bytes\": {}\n  }},\n  \"code_quality\": {{\n    \"complexity_score\": \"<1-10>\",\n    \"maintainability_score\": \"<1-10>\",\n    \"readability_score\": \"<1-10>\",\n    \"test_coverage_estimate\": \"<0-100>\"\n  }},\n  \"issues_found\": [\n    {{\n      \"severity\": \"high|medium|low\",\n      \"type\": \"bug|performance|security|style\",\n      \"description\": \"Brief description\",\n      \"location\": \"line 123 or function name\",\n      \"suggestion\": \"How to fix\"\n    }}\n  ],\n  \"dependencies\": [\n    {{\n      \"name\": \"library/module name\",\n      \"type\": \"external|internal|builtin\",\n      \"usage\": \"how it's used\"\n    }}\n  ]\n}}",
-        file_extension,
+        "Analyze this {} file and return a JSON response with structured analysis.\n\n\
+        USER REQUEST: {}\n\
+        CONVERSATION CONTEXT: {}\n\n\
+        Please analyze the code and return ONLY a valid JSON object with this structure:\n\
+        {{\n\
+          \"file_info\": {{\n\
+            \"path\": \"{}\",\n\
+            \"language\": \"{}\",\n\
+            \"lines_of_code\": <number>,\n\
+            \"size_bytes\": <number>\n\
+          }},\n\
+          \"code_quality\": {{\n\
+            \"complexity_score\": <1-10>,\n\
+            \"maintainability_score\": <1-10>,\n\
+            \"readability_score\": <1-10>,\n\
+            \"test_coverage_estimate\": <0-100>\n\
+          }},\n\
+          \"issues_found\": [\n\
+            {{\n\
+              \"severity\": \"high|medium|low\",\n\
+              \"type\": \"bug|performance|security|style\",\n\
+              \"description\": \"Brief description\",\n\
+              \"location\": \"line 123 or function name\",\n\
+              \"suggestion\": \"How to fix\"\n\
+            }}\n\
+          ],\n\
+          \"dependencies\": [\n\
+            {{\n\
+              \"name\": \"library/module name\",\n\
+              \"type\": \"external|internal|builtin\",\n\
+              \"usage\": \"how it's used\"\n\
+            }}\n\
+          ],\n\
+          \"functions\": [\n\
+            {{\n\
+              \"name\": \"function_name\",\n\
+              \"complexity\": <1-10>,\n\
+              \"parameters\": <number>,\n\
+              \"return_type\": \"type or description\",\n\
+              \"purpose\": \"brief description\"\n\
+            }}\n\
+          ],\n\
+          \"recommendations\": [\n\
+            {{\n\
+              \"priority\": \"high|medium|low\",\n\
+              \"category\": \"performance|security|maintainability|features\",\n\
+              \"description\": \"What to improve\",\n\
+              \"impact\": \"Expected benefit\"\n\
+            }}\n\
+          ],\n\
+          \"summary\": {{\n\
+            \"overall_score\": <1-10>,\n\
+            \"main_purpose\": \"What this code does\",\n\
+            \"key_strengths\": [\"strength1\", \"strength2\"],\n\
+            \"critical_issues\": [\"issue1\", \"issue2\"],\n\
+            \"next_steps\": [\"action1\", \"action2\"]\n\
+          }}\n\
+        }}\n\n\
+        Code to analyze:\n{}",
+        file_extension, query, conversation_history, file_path, file_extension, content
+    );
+    
+    let analysis = crate::gemini::query_gemini(&structured_prompt, config).await?;
+    
+    // Try to validate and format the JSON response
+    match serde_json::from_str::<serde_json::Value>(&analysis) {
+        Ok(json) => Ok(serde_json::to_string_pretty(&json).unwrap_or(analysis)),
+        Err(_) => {
+            // If not valid JSON, try to extract JSON from the response
+            if let Some(start) = analysis.find('{') {
+                if let Some(end) = analysis.rfind('}') {
+                    let json_str = &analysis[start..=end];
+                    match serde_json::from_str::<serde_json::Value>(json_str) {
+                        Ok(json) => Ok(serde_json::to_string_pretty(&json).unwrap_or(analysis)),
+                        Err(_) => Ok(format!("Structured Code Analysis for '{}':\n\n{}", file_path, analysis))
+                    }
+                } else {
+                    Ok(format!("Structured Code Analysis for '{}':\n\n{}", file_path, analysis))
+                }
+            } else {
+                Ok(format!("Structured Code Analysis for '{}':\n\n{}", file_path, analysis))
+            }
+        }
+    }
+}
+
+/// Execute code editing with intelligent recovery and fallback strategies
+async fn execute_edit_code_with_recovery(
+    function_call: &FunctionCall,
+    config: &Config,
+    conversation_history: &str
+) -> Result<String> {
+    // Attempt the primary, high-quality edit function first.
+    match execute_edit_code_with_path_and_query(function_call, config, conversation_history).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            // The primary edit failed. Log the failure and attempt a simplified recovery.
+            crate::thinking_display::PersistentStatusBar::set_ai_thinking("Primary edit failed. Attempting simplified recovery...");
+
+            // Use the error message from the failed attempt to inform the recovery.
+            let failure_reason = e.to_string();
+            execute_edit_with_simplified_prompt(function_call, config, &failure_reason).await
+        }
+    }
+}
+
+/// Create new file based on description when edit_code is called on non-existent file
+async fn execute_create_new_file_from_description(
+    file_path: &str,
+    description: &str,
+    config: &Config,
+    conversation_history: &str
+) -> Result<String> {
+    crate::thinking_display::PersistentStatusBar::set_ai_thinking("Creating new file based on description");
+    
+    let create_prompt = format!(
+        "You are an expert programmer. Create a high-quality, production-ready file: '{}'
+
+        Requirements: {}
+        
+        Context: {}
+        
+        IMPORTANT GUIDELINES:
+        - Write clean, well-structured, professional code
+        - Use modern best practices and patterns  
+        - Include proper error handling where appropriate
+        - Add meaningful comments for complex logic
+        - Ensure code is performant and maintainable
+        - Follow language-specific conventions
+        
+        Return ONLY the complete file content with NO markdown formatting, explanations, or code blocks.",
+        file_path, description, conversation_history
+    );
+    
+    let content = crate::gemini::query_gemini(&create_prompt, config).await?;
+    let validated_content = validate_and_extract_file_content(&content, "", file_path, description)?;
+    
+    write_file(std::path::Path::new(file_path), &validated_content).await?;
+    Ok(format!("Created new file '{}' with {} characters", file_path, validated_content.len()))
+}
+
+/// Simplified edit approach for recovery.
+async fn execute_edit_with_simplified_prompt(
+    function_call: &FunctionCall,
+    config: &Config,
+    failure_reason: &str // Now accepts the failure reason
+) -> Result<String> {
+    let file_path = function_call.arguments.get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing file_path parameter"))?;
+    
+    let query = function_call.arguments.get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing query parameter"))?;
+    
+    // IMPORTANT: Re-read the original content to avoid editing a broken file.
+    let current_content = read_file(std::path::Path::new(file_path)).await?;
+    
+    // Create a more informative prompt for the recovery attempt.
+    let simple_prompt = format!(
+        "A previous attempt to edit the file '{}' failed.
+Original Request: {}
+Previous Error: {}
+
+Please try again to edit the file with the original request. Return only the complete, updated file content.
+
+Current content:
+{}",
+        file_path, query, failure_reason, current_content
+    );
+    
+    let response = crate::gemini::query_gemini(&simple_prompt, config).await?;
+    let new_content = validate_and_extract_file_content(&response, &current_content, file_path, query)?;
+    
+    // Don't create diff during edit process - it interferes with editing
+    // Just do a simple change summary
+    let diff_info = if new_content != current_content {
+        let original_lines = current_content.lines().count();
+        let new_lines = new_content.lines().count();
+        let lines_added = new_lines.saturating_sub(original_lines);
+        let lines_removed = original_lines.saturating_sub(new_lines);
+        format!("\nChanges: +{} lines, -{} lines", lines_added, lines_removed)
+    } else {
+        "".to_string()
+    };
+    
+    write_file(std::path::Path::new(file_path), &new_content).await?;
+    Ok(format!("Updated '{}' using simplified approach{}", file_path, diff_info))
+}
+
+/// Analyze edit requirements and choose optimal strategy
+async fn analyze_edit_strategy(query: &str, content: &str, _file_path: &str) -> Result<EditStrategy> {
+    let file_size = content.len();
+    let query_words = query.split_whitespace().count();
+    let query_lower = query.to_lowercase();
+    
+    // Check for surgical edit indicators
+    let _is_targeted_change = query_words < 15 && (
+        query_lower.contains("rename") ||
+        query_lower.contains("change") && (
+            query_lower.contains("title") ||
+            query_lower.contains("name") ||
+            query_lower.contains("color") ||
+            query_lower.contains("text")
+        ) ||
+        query_lower.contains("fix") && query_words < 8 ||
+        query_lower.contains("add") && query_words < 10
+    );
+    
+    // Small, targeted changes should use surgical editing
+    if _is_targeted_change && file_size < 100_000 { // 100KB limit for surgical
+        return Ok(EditStrategy::Surgical);
+    }
+    
+    // Large files need chunked approach
+    if file_size > 50_000 { // 50KB threshold
+        return Ok(EditStrategy::Chunked);
+    }
+    
+    // Default to direct editing for medium-sized files with complex changes
+    Ok(EditStrategy::Direct)
+}
+
+/// Execute surgical editing using imara-diff for precise change injection
+async fn execute_surgical_edit(file_path: &str, content: &str, query: &str, config: &Config) -> Result<String> {
+    crate::thinking_display::PersistentStatusBar::set_ai_thinking("Using Surgical Editor with imara-diff");
+    
+    // Use fast heuristics to identify the target area (no AI call needed)
+    let target_area = identify_target_area_heuristically(content, query)?;
+    
+    // Extract only the relevant section for AI processing
+    let lines: Vec<&str> = content.lines().collect();
+    let context_start = target_area.start.saturating_sub(5); // 5 lines of context
+    let context_end = (target_area.end + 5).min(lines.len());
+    let context_lines = &lines[context_start..context_end];
+    let context_content = context_lines.join("\n");
+    
+    // Create focused prompt for surgical edit
+    let focused_prompt = format!(
+        "SURGICAL EDIT: Make only the specific change requested in this code section.
+
+TARGET CHANGE: {}
+SECTION TO EDIT (lines {}-{}):
+{}
+
+Return ONLY the modified section, keeping the same line structure.",
+        query, context_start + 1, context_end, context_content
+    );
+    
+    // Get AI response for just the section
+    let response = crate::gemini::query_gemini(&focused_prompt, config).await?;
+    let modified_section = validate_and_extract_file_content(&response, &context_content, file_path, query)?;
+    
+    // Use imara-diff to inject precise changes
+    inject_changes_precisely(content, &modified_section, context_start, context_end)
+}
+
+/// Use AI reasoning to identify target area instead of hardcoded patterns
+async fn identify_target_area_intelligently(content: &str, query: &str, config: &Config) -> Result<std::ops::Range<usize>> {
+    let lines: Vec<&str> = content.lines().collect();
+    
+    // Use AI to analyze the code structure and locate the target
+    let analysis_prompt = format!(
+        r#"LOCATE TARGET: Analyze this code and identify the exact line numbers that need to be modified for this request.
+
+REQUEST: {}
+
+CODE WITH LINE NUMBERS:
+{}
+
+Respond with ONLY the line numbers in format: START_LINE-END_LINE (e.g., "15-18" for lines 15 to 18)
+If the change affects a single line, use same number twice (e.g., "6-6")."#,
         query,
-        conversation_history,
-        file_path,
-        file_extension,
-        content.lines().count(),
-        content.len()
+        lines.iter().enumerate()
+            .map(|(i, line)| format!("{:3}: {}", i + 1, line))
+            .take(50) // Limit to first 50 lines for analysis
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    
+    // Try AI analysis with error handling
+    match crate::gemini::query_gemini(&analysis_prompt, config).await {
+        Ok(response) => {
+            let response = response.trim();
+            
+            // Try to extract line numbers from various response formats
+            let line_numbers = extract_line_numbers_from_response(response);
+            if let Some((start, end)) = line_numbers {
+                let start_idx = start.saturating_sub(1).min(lines.len().saturating_sub(1));
+                let end_idx = end.min(lines.len());
+                if start_idx < end_idx {
+                    return Ok(start_idx..end_idx);
+                }
+            }
+        },
+        Err(_) => {
+            // AI query failed, continue to heuristic fallback
+        }
+    }
+    
+    // Fallback: if AI analysis fails, use intelligent heuristics
+    identify_target_area_heuristic(lines, query)
+}
+
+/// Fast heuristic target identification (no AI calls)
+fn identify_target_area_heuristically(content: &str, query: &str) -> Result<std::ops::Range<usize>> {
+    let lines: Vec<&str> = content.lines().collect();
+    let query_lower = query.to_lowercase();
+    
+    // For button/event functionality
+    if query_lower.contains("button") || query_lower.contains("event") || query_lower.contains("scramble") {
+        // Look for event listener section or end of DOMContentLoaded
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("addEventListener") || line.contains("click") {
+                return Ok(i.saturating_sub(2)..lines.len().min(i + 10));
+            }
+        }
+        // If no event listeners found, target end of main function
+        for (i, line) in lines.iter().enumerate().rev() {
+            if line.contains("});") && i > lines.len() / 2 {
+                return Ok(i.saturating_sub(5)..i + 1);
+            }
+        }
+    }
+    
+    // For function additions, target the end of file
+    if query_lower.contains("function") || query_lower.contains("add") {
+        let end = lines.len();
+        return Ok(end.saturating_sub(10)..end);
+    }
+    
+    // Default: target middle section
+    let start = lines.len() / 3;
+    let end = lines.len() * 2 / 3;
+    Ok(start..end)
+}
+
+/// Extract line numbers from AI response in various formats
+fn extract_line_numbers_from_response(response: &str) -> Option<(usize, usize)> {
+    // Format 1: "15-18"
+    if let Some(dash_pos) = response.find('-') {
+        let start_str = response[..dash_pos].trim();
+        let end_str = response[dash_pos + 1..].trim();
+        
+        if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+            return Some((start, end));
+        }
+    }
+    
+    // Format 2: "line 15 to 18" or "lines 15-18"
+    if let Ok(regex) = regex::Regex::new(r"line[s]?\s+(\d+)(?:\s+to\s+|\s*-\s*)(\d+)") {
+        if let Some(captures) = regex.captures(response) {
+            if let (Some(start), Some(end)) = (captures.get(1), captures.get(2)) {
+                if let (Ok(start_num), Ok(end_num)) = (start.as_str().parse::<usize>(), end.as_str().parse::<usize>()) {
+                    return Some((start_num, end_num));
+                }
+            }
+        }
+    }
+    
+    // Format 3: Just numbers "15 18" or "15,18"
+    let numbers: Vec<usize> = response.split(|c: char| !c.is_numeric())
+        .filter_map(|s| s.parse().ok())
+        .take(2)
+        .collect();
+    
+    if numbers.len() >= 2 {
+        return Some((numbers[0], numbers[1]));
+    } else if numbers.len() == 1 {
+        return Some((numbers[0], numbers[0]));
+    }
+    
+    None
+}
+
+/// Intelligent heuristic-based target identification as fallback
+fn identify_target_area_heuristic(lines: Vec<&str>, query: &str) -> Result<std::ops::Range<usize>> {
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    let mut best_score = 0.0;
+    let mut best_range = 0..10; // Default small range
+    
+    // Score each potential section based on relevance
+    for start in 0..lines.len() {
+        for window_size in [1, 3, 5, 10] {
+            let end = (start + window_size).min(lines.len());
+            let section_text = lines[start..end].join(" ").to_lowercase();
+            
+            // Calculate relevance score
+            let mut score = 0.0;
+            for word in &query_words {
+                if section_text.contains(word) {
+                    score += word.len() as f64; // Longer words = more specific
+                }
+            }
+            
+            // Prefer smaller, more focused sections
+            score = score / (window_size as f64).sqrt();
+            
+            if score > best_score {
+                best_score = score;
+                best_range = start..end;
+            }
+        }
+    }
+    
+    // If no good match found, default to reasonable section
+    if best_score < 1.0 {
+        let default_end = (lines.len() / 5).max(5).min(lines.len());
+        best_range = 0..default_end;
+    }
+    
+    Ok(best_range)
+}
+
+/// Inject changes precisely using rope-like operations
+fn inject_changes_precisely(original: &str, modified_section: &str, start_line: usize, end_line: usize) -> Result<String> {
+    let mut lines: Vec<&str> = original.lines().collect();
+    let new_lines: Vec<&str> = modified_section.lines().collect();
+    
+    // Replace the target section
+    lines.splice(start_line..end_line, new_lines.iter().cloned());
+    
+    Ok(lines.join("\n"))
+}
+
+/// Execute editing on large files using FAST EDITOR SYSTEM
+async fn execute_large_file_edit(file_path: &str, content: &str, query: &str, config: &Config) -> Result<String> {
+    crate::thinking_display::PersistentStatusBar::set_ai_thinking("Using Fast Editor System");
+    
+    // Use the proper intelligent matching system 
+    match edit_file_in_chunks(content, query, config).await {
+        Ok(mut result) => {
+            // Extract the actual content from the result message using proper validation
+            let final_content = validate_and_extract_file_content(&result, content, file_path, query)?;
+            
+            // Don't show diff during edit - it interferes with the process
+            // Just track that changes were made
+            if final_content != content {
+                let original_lines = content.lines().count();
+                let new_lines = final_content.lines().count();
+                let lines_added = new_lines.saturating_sub(original_lines);
+                let lines_removed = original_lines.saturating_sub(new_lines);
+                result = format!("{}\nChanges: +{} lines, -{} lines", result, lines_added, lines_removed);
+            }
+            
+            write_file(std::path::Path::new(file_path), &final_content).await?;
+            Ok(result)
+        },
+        Err(e) => Err(e)
+    }
+}
+
+#[derive(Debug)]
+enum EditSection {
+    Start,
+    End,
+    Middle(usize, usize),
+}
+
+/// Edit a specific section of a large file
+async fn edit_file_section(content: &str, query: &str, config: &Config, section: EditSection) -> Result<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    
+    let (start_idx, end_idx, context_before, context_after) = match section {
+        EditSection::Start => {
+            (0, 500.min(lines.len()), String::new(), 
+             format!("... (file continues for {} more lines)", lines.len().saturating_sub(500)))
+        },
+        EditSection::End => {
+            let start = lines.len().saturating_sub(500);
+            (start, lines.len(), 
+             format!("(file starts with {} lines) ...", start),
+             String::new())
+        },
+        EditSection::Middle(start, end) => {
+            (start, end, 
+             format!("(previous {} lines) ...", start),
+             format!("... ({} more lines)", lines.len().saturating_sub(end)))
+        }
+    };
+    
+    let section_content = lines[start_idx..end_idx].join("\n");
+    
+    let edit_prompt = format!(
+        "Edit this section of a large file:\n\
+        Context: {}\n\n\
+        SECTION TO EDIT:\n{}\n\n\
+        Context: {}\n\n\
+        Task: {}\n\n\
+        Return only the edited section (not the full file):",
+        context_before, section_content, context_after, query
+    );
+    
+    let response = crate::gemini::query_gemini(&edit_prompt, config).await?;
+    
+    // Reconstruct the full file with the edited section
+    let mut result_lines = lines.to_vec();
+    let new_section_lines: Vec<&str> = response.lines().collect();
+    
+    // Replace the section
+    result_lines.splice(start_idx..end_idx, new_section_lines.iter().cloned());
+    
+    Ok(result_lines.join("\n"))
+}
+
+/// FAST SINGLE-CALL editor - like Claude Code
+pub async fn edit_file_in_chunks(content: &str, query: &str, config: &Config) -> Result<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    
+    // UNIVERSAL APPROACH: Process ANY file with diff patches to avoid MAX_TOKENS
+    if total_lines > 100 {
+        // The diff patch approach is too restrictive and can lead to low-quality code.
+        // Instead, we will use the more robust rope-based editor which handles large files
+        // and complex edits better by processing chunks and reassembling the file.
+        return process_large_file_with_rope(
+            "", // file_path is not available here, but the rope editor can handle it
+            content,
+            query,
+            config
+        ).await;
+    }
+    
+    // Fallback: process entire file in chunks (not recommended for very large files)
+    let chunk_size = 100; // Smaller chunks for fallback
+    let mut processed_content = String::new();
+    
+    for (chunk_index, chunk_start) in (0..lines.len()).step_by(chunk_size).enumerate() {
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, lines.len());
+        let chunk_lines = &lines[chunk_start..chunk_end];
+        let chunk_content = chunk_lines.join("\n");
+        
+        let chunk_prompt = format!(
+            "You are an expert programmer. Your task is to edit this chunk of code based on the user's query.\n\n\
+            User Query: {}\n\n\
+            Code Chunk (chunk {} of {}, lines {}-{}):\n```\n{}\n```\n\n\
+            IMPORTANT:\n\
+            - Return ONLY the complete, edited content for this specific chunk.\n\
+            - Ensure the code is syntactically correct and follows best practices.\n\
+            - Do not add explanations or markdown formatting.",
+            chunk_index + 1,
+            (lines.len() + chunk_size - 1) / chunk_size,
+            chunk_start + 1,
+            chunk_end,
+            query,
+            chunk_content
+        );
+        
+        match crate::gemini::query_gemini(&chunk_prompt, config).await {
+            Ok(edited_chunk) => {
+                if !processed_content.is_empty() {
+                    processed_content.push('\n');
+                }
+                processed_content.push_str(&edited_chunk);
+            },
+            Err(e) => {
+                return Err(anyhow!("Failed to edit chunk {} (lines {}-{}): {}", 
+                    chunk_index + 1, chunk_start + 1, chunk_end, e));
+            }
+        }
+    }
+    
+    Ok(processed_content)
+}
+
+/// Generates an edited version of the code for small files using a direct prompt.
+async fn generate_direct_edit(content: &str, query: &str, file_path: &str, config: &Config) -> Result<String> {
+    let edit_prompt = format!(
+        "You are an expert programmer. Modify this code to fulfill the request.\n\n\
+        Request: {}\n\n\
+        Current code:\n{}\n\n\
+        Requirements:\n\
+        - Write clean, readable code\n\
+        - Follow existing code style and patterns\n\
+        - Add appropriate comments for new functionality\n\
+        - Ensure the code works correctly\n\n\
+        Return ONLY the complete updated file content with no markdown formatting.",
+        query, content
     );
 
-    let analysis = gemini::query_gemini(&structured_prompt, config).await?;
-    Ok(format!("Structured analysis for '{}':\n\n{}", file_path, analysis))
+    let start_time = std::time::Instant::now();
+    
+    // Use function calling version to get token usage
+    let (response, _function_call, token_usage) = crate::gemini::query_gemini_with_function_calling(&edit_prompt, config, None).await?;
+    
+    let response_time_ms = start_time.elapsed().as_millis() as u32;
+    
+    // Update status with token information if available
+    if let Some(usage) = token_usage {
+        crate::thinking_display::PersistentStatusBar::update_status_with_tokens_and_timing(
+            "Editing code", 
+            usage.input_tokens, 
+            usage.output_tokens,
+            response_time_ms
+        );
+    }
+    
+    validate_and_extract_file_content(&response, content, file_path, query)
+}
+
+/// Simple, reliable edit function that doesn't use complex diff logic
+async fn execute_simple_edit(file_path: &str, content: &str, query: &str, config: &Config) -> Result<String> {
+    crate::thinking_display::PersistentStatusBar::set_ai_thinking("Using simple edit strategy");
+    
+    let simple_prompt = format!(
+        "Edit this file to: {}\n\nFile: {}\n\n{}\n\n\
+        Return ONLY the complete updated file content.",
+        query, file_path, content
+    );
+
+    let response = crate::gemini::query_gemini(&simple_prompt, config).await?;
+    
+    // Simple validation and extraction
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Empty response from AI"));
+    }
+    
+    // Extract from code blocks if present
+    let content = if trimmed.starts_with("```") {
+        // Find the content between code fences
+        let lines: Vec<&str> = trimmed.lines().collect();
+        if lines.len() >= 3 {
+            // Skip first and last lines
+            lines[1..lines.len()-1].join("\n")
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    };
+    
+    Ok(content)
+}
+
+/// Execute code editing with intelligent path resolution and query processing
+pub async fn execute_edit_code_with_path_and_query(
+    function_call: &FunctionCall,
+    config: &Config,
+    conversation_history: &str
+) -> Result<String> {
+    // Enhanced parameter validation with context awareness
+    let file_path = function_call.arguments.get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing file_path parameter. Available parameters: {:?}. Context: {}", function_call.arguments.keys().collect::<Vec<_>>(), conversation_history.lines().last().unwrap_or("No context")))?;
+    
+    let query = function_call.arguments.get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing query parameter. Available parameters: {:?}. Context: {}", function_call.arguments.keys().collect::<Vec<_>>(), conversation_history.lines().last().unwrap_or("No context")))?;
+    
+    // Real-time UI is already shown by the caller
+    
+    // METACOGNITIVE VALIDATION: Check if query is malformed/truncated
+    if is_malformed_query(query) {
+        return Err(anyhow!("Query appears to be malformed or truncated. Query: '{}'", query));
+    }
+    
+    // Read current file content
+    let current_content = read_file(Path::new(file_path)).await?;
+    
+    // Use simple heuristic strategy selection (no AI calls)
+    let edit_strategy = select_edit_strategy_fast(query, &current_content);
+    
+    let new_content = match edit_strategy {
+        EditStrategy::Surgical => {
+            // Use surgical editing for precise, targeted changes
+            crate::thinking_display::PersistentStatusBar::set_ai_thinking("Strategy: Surgical editing detected");
+            match execute_surgical_edit(file_path, &current_content, query, config).await {
+                Ok(content) => content,
+                Err(e) => {
+                    // Surgical editing failed, try reasoning-based approach
+                    crate::thinking_display::PersistentStatusBar::set_ai_thinking("Surgical editing failed, using reasoning approach");
+                    
+                    // Log the error through status system, not direct print
+                    crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("Surgical edit failed: {}", e.to_string().chars().take(80).collect::<String>()));
+                    
+                    // Use a simpler, more reliable approach
+                    match execute_simple_edit(file_path, &current_content, query, config).await {
+                        Ok(content) => content,
+                        Err(_) => {
+                            crate::thinking_display::PersistentStatusBar::set_ai_thinking("All edit methods failed, using basic replacement");
+                            // Last resort: basic edit
+                            generate_direct_edit(&current_content, query, file_path, config).await?
+                        }
+                    }
+                }
+            }
+        }
+        EditStrategy::Chunked => {
+            // For large files, use the robust, memory-efficient Rope-based editor
+            crate::thinking_display::PersistentStatusBar::set_ai_thinking("Strategy: Chunked editing for large file");
+            process_large_file_with_rope(file_path, &current_content, query, config).await?
+        }
+        EditStrategy::Direct => {
+            // For smaller files, use the direct, single-prompt approach
+            crate::thinking_display::PersistentStatusBar::set_ai_thinking("Strategy: Direct editing for medium complexity");
+            generate_direct_edit(&current_content, query, file_path, config).await?
+        }
+    };
+
+    // Simple diff info without breaking functionality
+    let _diff_info = if new_content != current_content {
+        // Count simple changes instead of complex diff
+        let original_lines = current_content.lines().count();
+        let new_lines = new_content.lines().count();
+        let lines_added = new_lines.saturating_sub(original_lines);
+        let lines_removed = original_lines.saturating_sub(new_lines);
+        
+        if lines_added > 0 || lines_removed > 0 {
+            format!("\nChanges: +{} lines, -{} lines", lines_added, lines_removed)
+        } else {
+            "\nChanges: content modified".to_string()
+        }
+    } else {
+        "".to_string() // No changes, no message
+    };
+
+    // Write the final content to the file.
+    write_file(Path::new(file_path), &new_content).await?;
+    
+    // Show completion in modern UI style
+    let changes = estimate_changes(&current_content, &new_content);
+    let file_display = if file_path.len() > 50 {
+        format!("...{}", &file_path[file_path.len() - 47..])
+    } else {
+        file_path.to_string()
+    };
+    
+    let result = if changes > 0 {
+        // UI completion is handled by caller
+        format!("Wrote {} bytes to '{}'", new_content.len(), file_display)
+    } else {
+        "No changes needed".to_string()
+    };
+    
+    Ok(result)
+}
+
+/// Metacognitive validation: Detect malformed or truncated queries
+fn is_malformed_query(query: &str) -> bool {
+    // Check for common signs of truncated/malformed queries
+    let indicators = [
+        // Ends abruptly without completing sentence
+        query.ends_with("1.") || query.ends_with("2.") || query.ends_with("3."),
+        // Missing spaces (common in truncated JSON)
+        query.contains("theRubik's") || query.contains("fortheRubik"),
+        // Ends with incomplete sentence structure
+        query.ends_with("cubelets") && !query.contains("?") && !query.contains("."),
+        // Very long single-sentence run-on (likely truncated)
+        !query.contains(".") && query.len() > 200,
+        // Contains formatting artifacts from truncated JSON
+        query.contains("\\`") || query.contains("'Add functions") && query.len() < 50,
+        // New patterns from recent failures
+        query.ends_with("This will") || query.ends_with("This function should:"),
+        query.ends_with("scramble.This function should:"),
+        // Ends with incomplete list items
+        query.contains("1. Define") && query.ends_with("This will"),
+        // Missing spaces in compound words (JSON parsing artifacts)
+        query.contains("scramble.This") || query.contains("moves.This"),
+    ];
+    
+    indicators.iter().any(|&condition| condition)
+}
+
+/// Fast strategy selection using simple heuristics (no AI calls)
+fn select_edit_strategy_fast(_query: &str, content: &str) -> EditStrategy {
+    let file_size = content.len();
+    
+    // Use Chunked strategy for large files, otherwise use Direct.
+    // Removed fragile Surgical strategy that was causing failures.
+    if file_size > 50_000 { // 50KB threshold
+        EditStrategy::Chunked
+    } else {
+        EditStrategy::Direct
+    }
+}
+
+/// Validate AI response and extract file content, preventing data corruption
+fn validate_and_extract_file_content(raw_response: &str, original_content: &str, file_path: &str, query: &str) -> Result<String> {
+    let trimmed_response = raw_response.trim();
+    
+    // Check if this is just a model name or metadata (not actual content)
+    if trimmed_response == "gemini-2.5-flash" || 
+       trimmed_response.starts_with("gemini-") ||
+       trimmed_response.starts_with("claude-") ||
+       trimmed_response.starts_with("gpt-") {
+        return Err(anyhow::anyhow!(
+            "Response parsing error - extracted model name instead of content. File: {}, Response: '{}'", 
+            file_path, trimmed_response
+        ));
+    }
+    
+    // Check if this looks like a random ID/hash instead of content
+    if trimmed_response.len() < 100 && 
+       trimmed_response.chars().all(|c| c.is_alphanumeric()) && 
+       !trimmed_response.contains(' ') &&
+       !trimmed_response.contains('<') {  // Not HTML
+        return Err(anyhow::anyhow!(
+            "Response parsing error - extracted ID/hash instead of content. File: {}, Response: '{}'", 
+            file_path, trimmed_response
+        ));
+    }
+    
+    // Check for obvious invalid responses that would corrupt the file (minimal check)
+    let invalid_indicators = [
+        "I cannot",
+        "I don't have access",
+        "Error:",
+    ];
+    
+    // Only reject if response is clearly an error message
+    if invalid_indicators.iter().any(|indicator| trimmed_response.starts_with(indicator)) {
+        return Err(anyhow::anyhow!(
+            "Invalid AI response detected - would corrupt file {}. Response: '{}'", 
+            file_path, trimmed_response
+        ));
+    }
+    
+    // For HTML files, ensure basic structure exists
+    if file_path.ends_with(".html") || file_path.ends_with(".htm") {
+        if !trimmed_response.contains("<!DOCTYPE") && !trimmed_response.contains("<html") {
+            return Err(anyhow::anyhow!(
+                "Invalid HTML response - missing basic HTML structure. File: {}", 
+                file_path
+            ));
+        }
+    }
+    
+    // Extract content from code blocks if present - be more aggressive
+    let content = if trimmed_response.starts_with("```") {
+        // Extract from code block
+        let lines: Vec<&str> = trimmed_response.lines().collect();
+        if lines.len() < 3 {
+            return Err(anyhow::anyhow!("Invalid code block format"));
+        }
+        
+        // Skip first and last lines (```)
+        let mut content_lines = Vec::new();
+        let mut in_content = false;
+        
+        for line in lines {
+            if line.starts_with("```") {
+                if in_content {
+                    break; // End of code block
+                } else {
+                    in_content = true; // Start of code block
+                }
+            } else if in_content {
+                content_lines.push(line);
+            }
+        }
+        content_lines.join("\n")
+    } else if trimmed_response.contains("```") {
+        // Handle inline code blocks
+        let start = trimmed_response.find("```").unwrap();
+        let after_start = &trimmed_response[start + 3..];
+        if let Some(end) = after_start.find("```") {
+            // Find the actual content start (skip language identifier)
+            let content_start = after_start.find('\n').map(|i| i + 1).unwrap_or(0);
+            after_start[content_start..end].to_string()
+        } else {
+            trimmed_response.to_string()
+        }
+    } else {
+        trimmed_response.to_string()
+    };
+    
+    // Smart validation for potential data corruption - but allow legitimate edits
+    let size_ratio = if original_content.len() > 0 {
+        content.len() as f64 / original_content.len() as f64
+    } else {
+        1.0 // New file creation
+    };
+    
+    let is_removal_task = query.to_lowercase().contains("remove") || 
+                         query.to_lowercase().contains("delete") ||
+                         query.to_lowercase().contains("clean") ||
+                         query.to_lowercase().contains("strip");
+    
+    // Only flag as corrupted if it's an extreme case AND not a removal task
+    let looks_corrupted = (size_ratio < 0.01 && !is_removal_task) || // >99% reduction without explicit removal
+                         content.is_empty() && !original_content.is_empty() && !is_removal_task;
+    
+    if looks_corrupted {
+        return Err(anyhow::anyhow!(
+            "AI response appears corrupted - extreme size reduction detected. Original: {} chars, New: {} chars (ratio: {:.2}). This may indicate the AI truncated or replaced the file content instead of editing it properly.",
+            original_content.len(), content.len(), size_ratio
+        ));
+    }
+    
+    Ok(content)
+}
+
+
+
+// Helper functions for path resolution
+pub fn smart_resolve_file_path_for_creation(file_path: &str, _context: Option<&str>) -> String {
+    let path = Path::new(file_path);
+    
+    // If it's already a proper path, use it
+    if path.is_absolute() || path.starts_with("./") || path.starts_with("../") {
+        return file_path.to_string();
+    }
+    
+    // For relative paths, ensure they're in current directory
+    if !file_path.starts_with("./") {
+        format!("./{}", file_path)
+    } else {
+        file_path.to_string()
+    }
+}
+
+/// Validate edit completion with diff analysis - fast and targeted
+async fn validate_edit_completion(function_call: &FunctionCall, result: &str) -> String {
+    // Extract file path from the function call
+    let file_path = match function_call.arguments.get("file_path").and_then(|v| v.as_str()) {
+        Some(path) => path,
+        None => return "Edit completed".to_string(), // Fallback if no file path
+    };
+    
+    // Extract the original query/intent
+    let query = function_call.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    
+    // Check if the result indicates success
+    if result.contains("Error:") || result.contains("Failed") {
+        return "Edit failed - see details above".to_string();
+    }
+    
+    // Extract diff statistics if available in the result
+    let lines_added = count_occurrences(result, "added") + count_occurrences(result, "inserted");
+    let lines_removed = count_occurrences(result, "removed") + count_occurrences(result, "deleted");
+    let lines_modified = count_occurrences(result, "modified") + count_occurrences(result, "changed");
+    
+    // Basic validation rules
+    let total_changes = lines_added + lines_removed + lines_modified;
+    
+    if total_changes == 0 {
+        return "No changes detected - verify edit was needed".to_string();
+    }
+    
+    // Check for suspicious patterns
+    if lines_removed > 50 && lines_added < 5 {
+        return format!("Warning: Removed {} lines but added only {} - verify this is correct", lines_removed, lines_added);
+    }
+    
+    if lines_removed > lines_added * 3 && lines_removed > 10 {
+        return format!("Warning: Removed significantly more lines ({}) than added ({}) - verify this is intentional", lines_removed, lines_added);
+    }
+    
+    // Check if query suggests adding functionality but we only removed lines
+    if query.to_lowercase().contains("add") && lines_removed > lines_added {
+        return format!("Warning: Query asked to 'add' but removed {} lines, added {} - review changes", lines_removed, lines_added);
+    }
+    
+    // Success cases
+    if total_changes <= 5 {
+        return "Edit completed - minor changes".to_string();
+    } else if total_changes <= 20 {
+        return format!("Edit completed - {} lines changed", total_changes);
+    } else {
+        return format!("Edit completed - {} lines changed (major update)", total_changes);
+    }
+}
+
+/// Helper function to count occurrences of a word in text
+fn count_occurrences(text: &str, word: &str) -> usize {
+    text.to_lowercase().matches(&word.to_lowercase()).count()
 }

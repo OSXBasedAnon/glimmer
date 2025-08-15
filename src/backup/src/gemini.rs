@@ -5,32 +5,6 @@ use crate::config::Config;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-// Removed unused MemoryEngine import
-
-#[derive(Debug, Clone)]
-pub struct TaskComplexity {
-    pub complexity_score: f32,
-    pub requires_multiple_steps: bool,
-    pub estimated_time: String,
-    pub risk_level: String,
-    pub complexity: String,
-    pub reasoning: String,
-    pub steps: Vec<String>,
-}
-
-pub async fn analyze_task_complexity(_input: &str, _context: &str, _config: &Config) -> Result<TaskComplexity> {
-    // Simple implementation - in post-refactor system, let AI handle complexity analysis
-    Ok(TaskComplexity {
-        complexity_score: 0.5,
-        requires_multiple_steps: false,
-        estimated_time: "Medium".to_string(),
-        risk_level: "Low".to_string(),
-        complexity: "Medium".to_string(),
-        reasoning: "Task appears straightforward".to_string(),
-        steps: vec!["Execute task".to_string()],
-    })
-}
-use crate::function_calling::FunctionCall;
 
 /// Smart rate limiter to prevent API overload and optimize performance
 #[derive(Debug)]
@@ -129,7 +103,7 @@ struct Content {
 #[serde(untagged)]
 enum Part {
     Text { text: String },
-    FunctionCall {
+    FunctionCall { 
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall 
     },
@@ -142,12 +116,6 @@ struct GeminiFunctionCall {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ThinkingConfig {
-    #[serde(rename = "thinkingBudget")]
-    thinking_budget: i32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct GenerationConfig {
     temperature: f32,
     max_output_tokens: u32,
@@ -155,10 +123,6 @@ struct GenerationConfig {
     response_logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
-    thinking_config: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -298,10 +262,10 @@ pub async fn edit_code(
         Some(key) if !key.trim().is_empty() => key,
         _ => {
             return Err(anyhow::anyhow!(
-                r#"Gemini API key not configured or empty. Please set GEMINI_API_KEY in:
-         1. Environment variable: export GEMINI_API_KEY=your_key
-         2. .env file in current directory: GEMINI_API_KEY=your_key
-         3. Config file at ~/.config/glimmer/config.toml"#
+                "Gemini API key not configured or empty. Please set GEMINI_API_KEY in:\n\
+                 1. Environment variable: export GEMINI_API_KEY=your_key\n\
+                 2. .env file in current directory: GEMINI_API_KEY=your_key\n\
+                 3. Config file at ~/.config/glimmer/config.toml"
             ));
         }
     };
@@ -331,8 +295,6 @@ pub async fn edit_code(
             max_output_tokens: 8192, // Increased from 4096 to prevent truncation
             response_logprobs: Some(true),
             logprobs: None,
-            response_mime_type: None,
-            thinking_config: None,
         },
     };
 
@@ -354,16 +316,16 @@ pub async fn edit_code(
                 // Check for specific error types
                 let error_msg = e.to_string();
                 if error_msg.contains("timeout") {
-                    eprintln!("Request timed out (attempt {}/{})\nRetrying with longer timeout...", attempt, config.gemini.max_retries);
+                    eprintln!("Request timed out (attempt {}/{}). Retrying with longer timeout...", attempt, config.gemini.max_retries);
                 } else if error_msg.contains("401") || error_msg.contains("403") {
                     return Err(anyhow::anyhow!("Authentication failed. Please check your Gemini API key."));
                 } else if error_msg.contains("429") {
-                    eprintln!("Rate limit exceeded (attempt {}/{})\nWaiting longer before retry...", attempt, config.gemini.max_retries);
+                    eprintln!("Rate limit exceeded (attempt {}/{}). Waiting longer before retry...", attempt, config.gemini.max_retries);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 } else if error_msg.contains("network") || error_msg.contains("connection") {
-                    eprintln!("Network error (attempt {}/{})\nRetrying...", attempt, config.gemini.max_retries);
+                    eprintln!("Network error (attempt {}/{}). Retrying...", attempt, config.gemini.max_retries);
                 } else {
-                    eprintln!("API error (attempt {}/{})\n: {}", attempt, config.gemini.max_retries, error_msg);
+                    eprintln!("API error (attempt {}/{}): {}", attempt, config.gemini.max_retries, error_msg);
                 }
                 
                 if attempt < config.gemini.max_retries {
@@ -393,7 +355,7 @@ async fn make_request(
             } else if e.is_connect() {
                 anyhow::anyhow!("Could not connect to Gemini API. Please check your internet connection.")
             } else if e.is_request() {
-                anyhow::anyhow!("Request failed: {}\n\nPlease check your API key and try again.", e)
+                anyhow::anyhow!("Request failed: {}. Please check your API key and try again.", e)
             } else {
                 anyhow::anyhow!("Network error communicating with Gemini API: {}", e)
             }
@@ -470,7 +432,7 @@ async fn make_request(
 async fn make_request_with_interrupt(
     client: &Client,
     url: &str,
-    request: &AdvancedGeminiRequest,
+    request: &GeminiRequest,
 ) -> Result<GeminiResponse> {
     // Create the request future
     let request_future = client
@@ -577,18 +539,17 @@ fn extract_text_from_response(response_text: &str) -> Option<String> {
     // Strategy 1: Look for any text field in the JSON
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response_text) {
         if let Some(text) = find_text_in_json(&json_value) {
-            // FIXED: Remove the arbitrary 10 character minimum that was filtering out valid responses
-            if !text.trim().is_empty() {
+            if !text.trim().is_empty() && text.len() > 10 {
                 return Some(text);
             }
         }
     }
     
-    // Strategy 2: Look for quoted strings that might be responses - improved patterns
+    // Strategy 2: Look for quoted strings that might be responses
     let text_patterns = [
-        r#"text"\s*:\s*"((?:[^"\\]|\\.)*)""#,  // Handle escaped quotes
-        r#"content"\s*:\s*"((?:[^"\\]|\\.)*)""#,
-        r#"response"\s*:\s*"((?:[^"\\]|\\.)*)""#,
+        r#""text"\s*:\s*"([^"]+)""#,
+        r#""content"\s*:\s*"([^"]+)""#,
+        r#""response"\s*:\s*"([^"]+)""#,
     ];
     
     for pattern in &text_patterns {
@@ -596,8 +557,7 @@ fn extract_text_from_response(response_text: &str) -> Option<String> {
             if let Some(captures) = regex.captures(response_text) {
                 if let Some(matched) = captures.get(1) {
                     let text = matched.as_str();
-                    // FIXED: Don't filter out short responses - they might be valid
-                    if !text.trim().is_empty() {
+                    if text.len() > 10 {
                         return Some(text.to_string());
                     }
                 }
@@ -801,7 +761,7 @@ fn create_edit_prompt(original_code: &str, query: &str, language: &str) -> Strin
     
     if is_simple_change {
         format!(
-            r###"SIMPLE EDIT REQUEST - Make this specific change efficiently:
+            r#"SIMPLE EDIT REQUEST - Make this specific change efficiently:
 
 REQUEST: {query}
 FILE TYPE: {language}
@@ -809,14 +769,14 @@ FILE TYPE: {language}
 ORIGINAL CODE:
 {original_code}
 
-Return ONLY the complete modified file. Focus on the exact change requested - be precise and efficient."###,
+Return ONLY the complete modified file. Focus on the exact change requested - be precise and efficient."#,
             query = query,
             language = language,
             original_code = original_code
         )
     } else {
         format!(
-            r###"You are an expert software engineer. Your task is to modify the provided {language} code according to the user's request.
+            r#"You are an expert software engineer. Your task is to modify the provided {language} code according to the user's request.
 The code you produce must be complete, functional, and high-quality.
 Apply modern best practices and ensure the fix actually addresses the issue described.
 
@@ -827,9 +787,10 @@ USER REQUEST: {query}
 
 ORIGINAL CODE:
 ```{language}
-{original_code}```
+{original_code}
+```
 
-Return the complete corrected file below (no markdown, no explanations):"###,
+Return the complete corrected file below (no markdown, no explanations):"#,
             language = language,
             original_code = original_code,
             query = query
@@ -981,7 +942,7 @@ fn calculate_code_likelihood_score(text: &str) -> i32 {
     
     // Look for code indicators
     let code_indicators = [
-        ("{ ", 1), ("}", 1), (";", 1), ("()", 1), ("[]", 1),
+        ("{", 1), ("}", 1), (";", 1), ("()", 1), ("[]", 1),
         ("function", 2), ("const", 2), ("let", 2), ("var", 2),
         ("class", 2), ("<!DOCTYPE", 3), ("<html", 3), ("<head", 3),
         ("import", 1), ("#include", 1), ("def ", 1), ("fn ", 1),
@@ -1067,7 +1028,7 @@ fn extract_from_explanatory_response(text: &str, original_code: &str) -> Option<
     let lines: Vec<&str> = text.lines().collect();
     
     // Check if this is a diff-like response
-    if text.contains("```diff") || text.contains("---") || text.contains("+++") {
+    if text.contains("```diff") || text.contains("--- ") || text.contains("+++ ") {
         return apply_diff_style_changes(text, original_code);
     }
     
@@ -1196,7 +1157,7 @@ let model = &config.gemini.default_model;
 
 let url = format!(
     "https://generativelanguage.googleapis.com/v1beta/models/{}:countTokens?key={}",
-    model, api_key.as_ref().ok_or_else(|| anyhow::anyhow!("Gemini API key not configured"))? 
+    model, api_key.as_ref().ok_or_else(|| anyhow::anyhow!("Gemini API key not configured"))?
 );
 
 let request_body = CountTokensRequest {
@@ -1242,87 +1203,6 @@ pub async fn query_gemini_fast(prompt: &str, config: &Config) -> Result<String> 
     query_gemini(&optimized_prompt, config).await
 }
 
-/// CLEAN Gemini query that bypasses all thinking extraction and returns raw response
-pub async fn query_gemini_clean(prompt: &str, config: &Config) -> Result<String> {
-    // Apply rate limiting to prevent API overload
-    let wait_duration = if let Ok(mut limiter) = RATE_LIMITER.lock() {
-        limiter.get_wait_duration()
-    } else {
-        None
-    };
-    
-    if let Some(duration) = wait_duration {
-        tokio::time::sleep(duration).await;
-    }
-    
-    // Record the request after waiting
-    if let Ok(mut limiter) = RATE_LIMITER.lock() {
-        limiter.record_request();
-    }
-    
-    let api_key = match config.gemini.api_key.as_ref() {
-        Some(key) if !key.trim().is_empty() => key,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Gemini API key not configured or empty. Please check your configuration."
-            ));
-        }
-    };
-
-    // Use the shared HTTP client with per-request timeout
-    let client = &*HTTP_CLIENT;
-
-    let request = AdvancedGeminiRequest {
-        contents: vec![Content {
-            parts: vec![Part::Text {
-                text: prompt.to_string(),
-            }],
-        }],
-        generation_config: GenerationConfig {
-            temperature: 0.1, // Very low temperature for consistent code generation
-            max_output_tokens: 8192,
-            response_logprobs: Some(false), // Disable logprobs for cleaner response
-            logprobs: None,
-            response_mime_type: Some("text/plain".to_string()), // Force plain text output
-            thinking_config: Some(ThinkingConfig {
-                thinking_budget: 0, // DISABLE ALL THINKING TOKENS
-            }),
-        },
-        system_instruction: Some(SystemInstruction {
-            parts: vec![Part::Text {
-                text: "You are a direct code generator. Respond ONLY with code. Do not think, analyze, or explain. Generate complete functional code immediately. Disable all internal reasoning.".to_string(),
-            }],
-        }),
-        tools: None,
-    };
-
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        config.gemini.default_model, api_key
-    );
-
-    // Make the request with interrupt support
-    let response = make_request_with_interrupt(&client, &url, &request).await?;
-    
-    // EXTRACT TEXT WITHOUT ANY PROCESSING
-    let candidate = response.candidates.first()
-        .ok_or_else(|| anyhow!("No candidates in response"))?;
-        
-    let part = candidate.content.as_ref()
-        .and_then(|c| c.parts.first())
-        .ok_or_else(|| anyhow!("No parts in response"))?;
-        
-    match part {
-        Part::Text { text } => {
-            // Return the raw text without ANY thinking extraction or processing
-            Ok(text.clone())
-        },
-        Part::FunctionCall { .. } => {
-            Err(anyhow!("Expected text response but received function call"))
-        }
-    }
-}
-
 pub async fn query_gemini(prompt: &str, config: &Config) -> Result<String> {
     // Apply rate limiting to prevent API overload
     let wait_duration = if let Ok(mut limiter) = RATE_LIMITER.lock() {
@@ -1352,7 +1232,7 @@ pub async fn query_gemini(prompt: &str, config: &Config) -> Result<String> {
 // Use the shared HTTP client with per-request timeout
 let client = &*HTTP_CLIENT;
 
-let request = AdvancedGeminiRequest {
+let request = GeminiRequest {
     contents: vec![Content {
         parts: vec![Part::Text {
             text: prompt.to_string(),
@@ -1363,15 +1243,7 @@ let request = AdvancedGeminiRequest {
         max_output_tokens: 8192, // INCREASED for diff patches
         response_logprobs: Some(true),
         logprobs: None,
-        response_mime_type: None,
-        thinking_config: None, // Keep thinking enabled for regular queries
     },
-    system_instruction: Some(SystemInstruction {
-        parts: vec![Part::Text {
-            text: "You are a highly skilled coding assistant. Always provide complete, functional code. Never provide partial responses, descriptions, or explanations unless specifically requested. When editing files, return the COMPLETE updated file content.".to_string(),
-        }],
-    }),
-    tools: None,
 };
 
 let url = format!(
@@ -1442,9 +1314,9 @@ match part {
 
 /// Enhanced query with function calling support and thinking display
 pub async fn query_gemini_with_function_calling(
-    prompt: &str,
-    config: &Config,
-    function_definitions: Option<&[crate::function_calling::FunctionDefinition]>,
+prompt: &str,
+config: &Config,
+function_definitions: Option<&[crate::function_calling::FunctionDefinition]>,
 ) -> Result<(String, Option<crate::function_calling::FunctionCall>, Option<TokenUsage>)> {
     // Apply rate limiting to prevent API overload
     let wait_duration = if let Ok(mut limiter) = RATE_LIMITER.lock() {
@@ -1480,15 +1352,7 @@ pub async fn query_gemini_with_function_calling(
             .iter()
             .map(|f| {
                 // Create proper JSON Schema for Gemini API
-                let params_schema = serde_json::json!({
-                    "type": "object",
-                    "properties": f.parameters.iter().map(|p| {
-                        (p.name.clone(), serde_json::json!({
-                            "type": p.param_type,
-                            "description": p.description
-                        }))
-                    }).collect::<serde_json::Map<String, serde_json::Value>>()
-                });
+                let params_schema = create_function_parameter_schema(&f.parameters);
                     
                 FunctionDeclaration {
                     name: f.name.clone(),
@@ -1534,8 +1398,6 @@ pub async fn query_gemini_with_function_calling(
             max_output_tokens: 2048,
             response_logprobs: Some(true),
             logprobs: None,
-            response_mime_type: None,
-            thinking_config: None,
         },
         system_instruction: Some(SystemInstruction {
             parts: vec![Part::Text {
@@ -1548,9 +1410,9 @@ CRITICAL EMERGENCY PROTOCOLS:
 - When something stops working after your changes, immediately read the affected files and diagnose
 
 ANTI-DEFENSIVE BEHAVIOR:
-- NEVER respond with \"could you please clarify\" or \"I don't have a record of\" when context is obvious
+- NEVER respond with \"could you please clarify\" or \"I don\'t have a record of\" when context is obvious
 - When users mention files, folders, or code, immediately investigate rather than asking questions
-- Assume intelligent intent - if user mentions 'cube' after HTML/JS work, they mean the display element
+- Assume intelligent intent - if user mentions \'cube\' after HTML/JS work, they mean the display element
 - Take action first, ask questions only when genuinely ambiguous
 
 CORE PRINCIPLES:
@@ -1631,13 +1493,13 @@ Use available functions proactively to complete tasks efficiently.".to_string(),
                 if let Some(usage) = &token_usage {
                     thinking_display.update_status_with_tokens(
                         "Complete", 
-                        usage.input_tokens,
+                        usage.input_tokens, 
                         usage.output_tokens
                     );
                     // Update status bar with tokens and timing
                     crate::thinking_display::PersistentStatusBar::update_status_with_tokens_and_timing(
                         "Complete", 
-                        usage.input_tokens,
+                        usage.input_tokens, 
                         usage.output_tokens,
                         response_time_ms
                     );
@@ -1722,8 +1584,6 @@ Be thorough in your analysis before providing solutions".to_string(),
             max_output_tokens: thinking_budget.unwrap_or(2048),
             response_logprobs: Some(true),
             logprobs: Some(3), // Top 3 token probabilities
-            response_mime_type: None,
-            thinking_config: None,
         },
         system_instruction,
         tools: None,
@@ -1883,88 +1743,31 @@ fn extract_thinking_response(response: &GeminiResponse) -> Result<(String, Optio
 }
 
 fn extract_thinking_content(text: &str) -> (String, Option<String>) {
-    // CRITICAL: Detect if this is a code response and avoid processing it
-    if is_code_response(text) {
-        // For code responses, return as-is without any thinking extraction
-        return (text.to_string(), None);
-    }
-    
     // Look for <thinking>...</thinking> tags
     if let Some(thinking_start) = text.find("<thinking>") {
         if let Some(thinking_end) = text.find("</thinking>") {
             let thinking_content = text[thinking_start + 10..thinking_end].trim().to_string();
+            let main_content = text[..thinking_start].trim().to_string() +
+            text[thinking_end + 11..].trim();
             
-            // Robust main content extraction
-            let before_thinking = text[..thinking_start].trim();
-            let after_thinking = text[thinking_end + 11..].trim();
-            let main_content = if before_thinking.is_empty() && after_thinking.is_empty() {
-                // If no content outside thinking tags, return original text to be safe
-                text.to_string()
-            } else {
-                format!("{}{}{}", 
-                    before_thinking,
-                    if !before_thinking.is_empty() && !after_thinking.is_empty() { " " } else { "" },
-                    after_thinking
-                ).trim().to_string()
-            };
-            
-            // Only extract reasoning for non-code responses
-            if !is_code_response(&main_content) {
-                let best_reasoning = extract_best_reasoning(&thinking_content);
-                if let Some(reasoning) = best_reasoning {
-                    crate::thinking_display::PersistentStatusBar::set_ai_thinking(&reasoning);
-                }
+            // Extract the most interesting reasoning from thinking content
+            let best_reasoning = extract_best_reasoning(&thinking_content);
+            if let Some(reasoning) = best_reasoning {
+                // Send the best reasoning line to the 💭 display
+                crate::thinking_display::PersistentStatusBar::set_ai_thinking(&reasoning);
             }
             
-            return (main_content, Some(thinking_content));
+            return (main_content.trim().to_string(), Some(thinking_content));
         }
     }
     
-    // Don't extract random reasoning from edit responses - causes single word bugs
-    (text.to_string(), None)
-}
+    // Try to extract reasoning from other patterns if no <thinking> tags
+    let inferred_reasoning = extract_reasoning_from_text(text);
+    if let Some(reasoning) = inferred_reasoning {
+        crate::thinking_display::PersistentStatusBar::set_ai_thinking(&reasoning);
+    }
 
-/// Detect if response is primarily code content that shouldn't be processed for thinking extraction
-fn is_code_response(text: &str) -> bool {
-    let text = text.trim();
-    
-    // Quick check for common code patterns
-    if text.starts_with("<!DOCTYPE") ||
-       text.starts_with("<html") ||
-       text.starts_with("<script") ||
-       text.starts_with("<style") ||
-       text.starts_with("function ") ||
-       text.starts_with("const ") ||
-       text.starts_with("let ") ||
-       text.starts_with("var ") ||
-       text.starts_with("import ") ||
-       text.starts_with("export ") {
-        return true;
-    }
-    
-    // Check if the text is mostly HTML/CSS/JS code
-    let code_indicators = [
-        "<", ">", "{", "}", ";", "(", ")",
-        "function", "const", "let", "var", "class", "div", "span"
-    ];
-    
-    let lines = text.lines().collect::<Vec<_>>();
-    let total_lines = lines.len();
-    if total_lines == 0 { return false; }
-    
-    let mut code_lines = 0;
-    for line in &lines {
-        let line_trim = line.trim();
-        if line_trim.is_empty() { continue; }
-        
-        // Count lines that look like code
-        if code_indicators.iter().any(|&indicator| line_trim.contains(indicator)) {
-            code_lines += 1;
-        }
-    }
-    
-    // If more than 60% of lines contain code indicators, treat as code response
-    (code_lines as f32 / total_lines as f32) > 0.6
+    (text.to_string(), None)
 }
 
 fn extract_best_reasoning(thinking_content: &str) -> Option<String> {
@@ -2033,7 +1836,7 @@ fn extract_confidence_metrics(logprobs_result: &LogprobsResult) -> Option<String
             ""
         };
         
-        Some(format!("{}% ({} {})", assessment.score as u32, assessment.level, uncertainty_label))
+        Some(format!("{}% ({}{})", assessment.score as u32, assessment.level, uncertainty_label))
     } else {
         None
     }
@@ -2043,7 +1846,7 @@ fn calculate_confidence_assessment(logprobs_result: &LogprobsResult) -> Option<C
     if let Some(chosen) = &logprobs_result.chosen_candidates {
         if !chosen.is_empty() {
             let total_tokens = chosen.len() as f64;
-            let avg_logprob = chosen.iter() 
+            let avg_logprob = chosen.iter()
                 .map(|c| c.log_probability)
                 .sum::<f64>() / total_tokens;
             
@@ -2104,8 +1907,6 @@ pub async fn query_gemini_with_function_calling_and_thinking(
         max_output_tokens: 4096, // Default output tokens
         response_logprobs: Some(true),
         logprobs: Some(3),
-        response_mime_type: None,
-        thinking_config: None,
     };
 
     // Adjust for thinking budget if provided
@@ -2200,49 +2001,518 @@ METACOGNITION:
         config.gemini.default_model, api_key
     );
 
-    let mut last_error = None;
-
-    for attempt in 1..=config.gemini.max_retries {
-        match make_advanced_request(&client, &url, &request).await {
-            Ok(response) => {
-                let token_usage = extract_actual_token_usage(&response, None);
-                let (text, function_call) = extract_function_call_response(&response)?;
-                return Ok((text, function_call, token_usage));
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| {
+            // Provide more specific error information for advanced requests
+            if e.is_timeout() {
+                anyhow::anyhow!("Gemini API request timed out")
+            } else if e.is_connect() {
+                anyhow::anyhow!("Failed to connect to Gemini API (network error): {}", e)
+            } else if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+                anyhow::anyhow!("Gemini API rate limit exceeded - too many requests after edit operations")
+            } else if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
+                anyhow::anyhow!("Gemini API authentication failed - please check your API key")
+            } else {
+                anyhow::anyhow!("Failed to send request to Gemini API: {}", e)
             }
-            Err(e) => {
-                last_error = Some(e);
-                if attempt < config.gemini.max_retries {
-                    tokio::time::sleep(Duration::from_millis(1000 * attempt as u64)).await;
+        })?;
+
+    let response_text = response.text().await?;
+    
+    match serde_json::from_str::<GeminiResponse>(&response_text) {
+        Ok(gemini_response) => {
+            let token_usage = Some(calculate_token_usage(&gemini_response, prompt));
+            
+            // Check for malformed function call finish reason
+            if let Some(candidate) = gemini_response.candidates.first() {
+                if let Some(finish_reason) = &candidate.finish_reason {
+                    if finish_reason == "MALFORMED_FUNCTION_CALL" {
+                        // Fallback to simple text generation without function calling
+                        return query_gemini_with_thinking(prompt, config, thinking_budget).await
+                            .map(|(response, _thinking)| (response, None, token_usage));
+                    }
+                }
+            }
+            
+            // Try to extract function call first
+            match extract_function_call_response(&gemini_response) {
+                Ok((text_response, function_call)) => {
+                    // Extract thinking content from the text response
+                    let (main_response, _thinking) = extract_thinking_content(&text_response);
+                    Ok((main_response, function_call, token_usage))
+                }
+                Err(_) => {
+                    // Fallback to thinking response extraction
+                    let (text_response, _thinking) = extract_thinking_response(&gemini_response)?;
+                    Ok((text_response, None, token_usage))
                 }
             }
         }
+        Err(parse_error) => {
+            Err(anyhow::anyhow!(
+                "Unable to parse Gemini API response: {}. Response: {}",
+                parse_error,
+                if response_text.len() > 500 { 
+                    format!("{}...", &response_text[..500]) 
+                } else { 
+                    response_text 
+                }
+            ))
+        }
     }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All retry attempts failed")))
 }
 
-fn extract_function_call_response(response: &GeminiResponse) -> Result<(String, Option<FunctionCall>)> {
-    let candidate = response.candidates.first().context("No candidates in response")?;
+/// Calculate token usage from Gemini response
+fn calculate_token_usage(response: &GeminiResponse, prompt: &str) -> TokenUsage {
+    if let Some(usage) = &response.usage_metadata {
+        return TokenUsage {
+            input_tokens: usage.prompt_token_count,
+            output_tokens: Some(usage.candidates_token_count),
+            total_tokens: usage.total_token_count,
+        };
+    }
+    
+    // Fallback to rough estimate if no usage metadata
+    let input_tokens = prompt.split_whitespace().count() as u32;
+    let output_tokens = response.candidates.first()
+        .and_then(|c| c.token_count);
+    
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens + output_tokens.unwrap_or(0),
+    }
+}
 
-    if let Some(content) = &candidate.content {
-        if let Some(part) = content.parts.first() {
-            return match part {
-                Part::Text { text } => Ok((text.clone(), None)),
-                Part::FunctionCall { function_call } => {
-                    let args = function_call.args.to_string();
-                    let parsed_args: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&args)
-                        .context("Failed to parse function call arguments")?;
+fn extract_function_call_response(response: &GeminiResponse) -> Result<(String, Option<crate::function_calling::FunctionCall>)> {
+    let candidate = response.candidates.first()
+        .context("No candidates in Gemini response")?;
+    
+    // Handle cases where content field is missing (e.g., MALFORMED_FUNCTION_CALL)
+    if candidate.content.as_ref().map_or(true, |c| c.parts.is_empty()) {
+        return Ok(("The AI encountered an issue generating a response. Let me try a different approach.".to_string(), None));
+    }
 
-                    Ok((
-                        String::new(), 
-                        Some(FunctionCall {
-                            name: function_call.name.clone(),
-                            arguments: parsed_args.into_iter().collect(),
-                        })
-                    ))
+    let part = candidate.content.as_ref().and_then(|c| c.parts.first())
+        .context("No parts in Gemini response")?;
+
+    match part {
+        Part::FunctionCall { function_call } => {
+            // Validate function call parameters before creating FunctionCall
+            let func_call = match validate_function_call_parameters(&function_call.name, &function_call.args) {
+                Ok(validated_params) => {
+                    // Convert Value to HashMap<String, Value>
+                    let args_map = if let serde_json::Value::Object(obj) = validated_params {
+                        obj.into_iter().collect()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                    
+                    crate::function_calling::FunctionCall {
+                        name: function_call.name.clone(),
+                        arguments: args_map,
+                    }
+                },
+                Err(e) => {
+                    // Enhanced error logging with function call details
+                    // Function validation failed - log to status bar instead of corrupting UI
+                    crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("🔧 Function validation failed: {}", function_call.name));
+                    
+                    // Attempt parameter correction for common issues
+                    if let Ok(corrected_call) = attempt_parameter_correction(&function_call.name, &function_call.args) {
+                        // Parameters auto-corrected - show in status bar
+                        crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("✅ Auto-corrected parameters for {}", function_call.name));
+                        return Ok((String::new(), Some(corrected_call)));
+                    }
+                    
+                    // If correction fails, return informative error
+                    let error_text = format!(
+                        "Function call validation failed for '{}'. Error: {}\n\nThis is a system issue that has been logged. Please try rephrasing your request.",
+                        function_call.name, e
+                    );
+                    return Ok((error_text, None));
                 }
             };
+            Ok((String::new(), Some(func_call)))
+        },
+        Part::Text { text } => {
+            if text.starts_with("API Error:") {
+                Err(anyhow::anyhow!("{}", text))
+            } else {
+                // Also try to parse function calls from text for backward compatibility
+                if let Some(func_call) = parse_function_call_from_text_safely(text) {
+                    Ok((String::new(), Some(func_call)))
+                } else {
+                    Ok((text.clone(), None))
+                }
+            }
         }
     }
-    Ok((String::new(), None))
+}
+
+/// Attempt to auto-correct common parameter issues
+fn attempt_parameter_correction(function_name: &str, params: &serde_json::Value) -> Result<crate::function_calling::FunctionCall> {
+    let mut corrected_params = params.clone();
+    
+    // Common corrections based on function type
+    match function_name {
+        "read_file" | "write_file" | "edit_code" => {
+            // Ensure file_path exists and is a string
+            if let serde_json::Value::Object(ref mut obj) = corrected_params {
+                // Fix common path format issues
+                if let Some(path_val) = obj.get_mut("file_path") {
+                    if let Some(path_str) = path_val.as_str() {
+                        // Normalize path separators for Windows
+                        let normalized_path = path_str.replace("/", "\\");
+                        *path_val = serde_json::Value::String(normalized_path);
+                    }
+                }
+                
+                // Add missing required parameters with defaults
+                if !obj.contains_key("file_path") && obj.contains_key("path") {
+                    if let Some(path) = obj.remove("path") {
+                        obj.insert("file_path".to_string(), path);
+                    }
+                }
+                
+                // Fix parameter name mapping for edit_code function
+                if function_name == "edit_code" {
+                    // Map "instructions" or "content" to "query"
+                    if !obj.contains_key("query") {
+                        if let Some(instructions) = obj.remove("instructions") {
+                            obj.insert("query".to_string(), instructions);
+                        } else if let Some(content) = obj.remove("content") {
+                            obj.insert("query".to_string(), content);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    
+    // Try validation again with corrected parameters
+    let validated = validate_function_call_parameters(function_name, &corrected_params)?;
+    
+    let args_map = if let serde_json::Value::Object(obj) = validated {
+        obj.into_iter().collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    
+    Ok(crate::function_calling::FunctionCall {
+        name: function_name.to_string(),
+        arguments: args_map,
+    })
+}
+
+/// Create proper JSON Schema for function parameters (Gemini API compatible)
+fn create_function_parameter_schema(parameters: &[crate::function_calling::Parameter]) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    
+    for param in parameters {
+        // Map our parameter types to JSON Schema types
+        let json_type = match param.param_type.as_str() {
+            "string" => "string",
+            "number" | "integer" => "number",
+            "boolean" => "boolean",
+            "array" => "array",
+            "object" => "object",
+            _ => "string", // Default fallback
+        };
+        
+        let mut property_schema = serde_json::json!({
+            "type": json_type,
+            "description": param.description
+        });
+        
+        // Add rich validation patterns based on parameter name and type
+        if json_type == "string" {
+            match param.name.as_str() {
+                name if name.contains("url") || name.contains("link") => {
+                    property_schema["format"] = serde_json::json!("uri");
+                },
+                name if name.contains("email") => {
+                    property_schema["format"] = serde_json::json!("email");
+                },
+                name if name.contains("date") => {
+                    property_schema["format"] = serde_json::json!("date");
+                    property_schema["pattern"] = serde_json::json!("^\\d{4}-\\d{2}-\\d{2}$");
+                },
+                name if name.contains("time") => {
+                    property_schema["format"] = serde_json::json!("time");
+                },
+                name if name.contains("path") || name.contains("file") => {
+                    property_schema["pattern"] = serde_json::json!("^[^\\x00-\\x1f\\x7f\"*<>?|]+$");
+                },
+                name if name.contains("color") => {
+                    property_schema["pattern"] = serde_json::json!("^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$");
+                },
+                name if name.contains("version") => {
+                    property_schema["pattern"] = serde_json::json!("^\\d+\\.\\d+(\\.\\d+)?(-[a-zA-Z0-9]+)?$");
+                },
+                _ => {}
+            }
+            
+            // Add common string constraints
+            if param.description.contains("required") || param.required {
+                property_schema["minLength"] = serde_json::json!(1);
+            }
+        }
+        
+        // Add numeric constraints
+        if json_type == "number" {
+            match param.name.as_str() {
+                name if name.contains("port") => {
+                    property_schema["minimum"] = serde_json::json!(1);
+                    property_schema["maximum"] = serde_json::json!(65535);
+                },
+                name if name.contains("percentage") || name.contains("percent") => {
+                    property_schema["minimum"] = serde_json::json!(0);
+                    property_schema["maximum"] = serde_json::json!(100);
+                },
+                name if name.contains("timeout") || name.contains("delay") => {
+                    property_schema["minimum"] = serde_json::json!(0);
+                },
+                name if name.contains("limit") || name.contains("max") => {
+                    property_schema["minimum"] = serde_json::json!(1);
+                },
+                _ => {
+                    // General numeric constraints
+                    if param.description.contains("positive") {
+                        property_schema["minimum"] = serde_json::json!(0);
+                    }
+                }
+            }
+        }
+        
+        // Add array constraints
+        if json_type == "array" {
+            property_schema["minItems"] = serde_json::json!(0);
+            if param.required {
+                property_schema["minItems"] = serde_json::json!(1);
+            }
+        }
+        
+        properties.insert(param.name.clone(), property_schema);
+        
+        if param.required {
+            required.push(param.name.clone());
+        }
+    }
+    
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required
+    })
+}
+
+/// Validate function call parameters to prevent malformed errors
+fn validate_function_call_parameters(function_name: &str, params: &serde_json::Value) -> Result<serde_json::Value> {
+    // Basic validation - ensure parameters is an object
+    if !params.is_object() {
+        return Err(anyhow!("Parameters must be a JSON object, got: {}", params));
+    }
+    
+    // Function-specific validation
+    match function_name {
+        "create_file" | "edit_code" => {
+            let obj = params.as_object().unwrap();
+            if !obj.contains_key("file_path") {
+                return Err(anyhow!("Missing required file_path parameter"));
+            }
+            if !obj.contains_key("query") {
+                return Err(anyhow!("Missing required query parameter"));
+            }
+        },
+        "search_music" => {
+            let obj = params.as_object().unwrap();
+            if !obj.contains_key("query") {
+                return Err(anyhow!("Missing required query parameter"));
+            }
+        },
+        _ => {
+            // For unknown functions, just ensure it's a valid object
+            if params.as_object().is_none() {
+                return Err(anyhow!("Invalid parameter object"));
+            }
+        }
+    }
+    
+    Ok(params.clone())
+}
+
+/// Safely parse function calls from text with better error handling
+fn parse_function_call_from_text_safely(text: &str) -> Option<crate::function_calling::FunctionCall> {
+    // Look for JSON function call in the response with improved parsing
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            let json_str = &text[start..=end];
+
+            // Try to parse as function call with error recovery
+            match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(parsed) => {
+                    if let Some(function_call_obj) = parsed.get("function_call") {
+                        if let (Some(name), Some(params)) = (
+                            function_call_obj.get("name").and_then(|n| n.as_str()),
+                            function_call_obj.get("arguments")
+                        ) {
+                            // Validate before returning
+                            match validate_function_call_parameters(name, params) {
+                                Ok(validated_params) => {
+                                    // Convert Value to HashMap<String, Value>
+                                    let args_map = if let serde_json::Value::Object(obj) = validated_params {
+                                        obj.into_iter().collect()
+                                    } else {
+                                        std::collections::HashMap::new()
+                                    };
+                                    
+                                    return Some(crate::function_calling::FunctionCall {
+                                        name: name.to_string(),
+                                        arguments: args_map,
+                                    });
+                                },
+                                Err(_) => {
+                                    // Invalid function parameters - show in status bar
+                                    crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("⚠️ Invalid function call parameters: {}", name));
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    // JSON parse failed - show in status bar instead of corrupting display
+                    crate::thinking_display::PersistentStatusBar::set_ai_thinking(&format!("⚠️ Failed to parse JSON from Gemini response: {}", e));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// Removed old parse_function_call_from_text - replaced with safer version above
+
+pub async fn analyze_task_complexity(input: &str, context: &str, config: &Config) -> Result<TaskComplexity> {
+    let analysis_prompt = format!(
+        r#"Analyze this user request for task complexity:
+Request: "{}"
+Context: {}
+Determine:
+1. Is this a simple task (can be done in one step)?
+2. Is this a complex task requiring multiple steps?
+3. What are the main steps needed?
+4. Are there any dependencies or prerequisites?
+Respond with JSON in this exact format:
+{{
+"complexity": "simple" | "moderate" | "complex",
+"reasoning": "explanation of complexity",
+"steps": ["step1", "step2", ...],
+"requires_planning": true | false,
+"estimated_time": "short" | "medium" | "long"
+}}"#,
+        input,
+        context
+    );
+
+    let response = query_gemini(&analysis_prompt, config).await?;
+
+    // Try to parse JSON response
+    match parse_task_complexity_response(&response) {
+        Ok(complexity) => Ok(complexity),
+        Err(_) => {
+            // Fallback to simple analysis
+            Ok(TaskComplexity {
+                complexity: determine_fallback_complexity(input),
+                reasoning: "Automated analysis based on keyword detection".to_string(),
+                steps: vec![input.to_string()],
+                requires_planning: false,
+                estimated_time: "medium".to_string(),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskComplexity {
+    pub complexity: String,
+    pub reasoning: String,
+    pub steps: Vec<String>,
+    pub requires_planning: bool,
+    pub estimated_time: String,
+}
+
+fn parse_task_complexity_response(response: &str) -> Result<TaskComplexity> {
+    // Try to extract JSON from response
+    let json_str = if response.contains('{') {
+        let start = response.find('{').unwrap();
+        let end = response.rfind('}').unwrap_or(response.len() - 1);
+        &response[start..=end]
+    } else {
+        response
+    };
+
+    let parsed: serde_json::Value = serde_json::from_str(json_str)?;
+
+    Ok(TaskComplexity {
+        complexity: parsed.get("complexity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("moderate")
+            .to_string(),
+        reasoning: parsed.get("reasoning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Analysis not available")
+            .to_string(),
+        steps: parsed.get("steps")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_else(|| vec!["Complete the task".to_string()]),
+        requires_planning: parsed.get("requires_planning")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        estimated_time: parsed.get("estimated_time")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium")
+            .to_string(),
+    })
+}
+
+fn determine_fallback_complexity(input: &str) -> String {
+    let input_lower = input.to_lowercase();
+    let complex_indicators = [
+        "implement", "create from scratch", "build entire", "refactor", "optimize",
+        "multiple files", "several", "many", "all", "every", "complete system",
+        "architecture", "design", "full", "entire", "comprehensive", "advanced"
+    ];
+
+    let simple_indicators = [
+        "fix this", "change", "update", "edit", "modify", "small", "quick",
+        "simple", "just", "only", "single"
+    ];
+
+    let complex_count = complex_indicators.iter()
+        .filter(|&indicator| input_lower.contains(indicator))
+        .count();
+    
+    let simple_count = simple_indicators.iter()
+        .filter(|&indicator| input_lower.contains(indicator))
+        .count();
+
+    if complex_count > simple_count && complex_count >= 2 {
+        "complex".to_string()
+    } else if complex_count > 0 || input.len() > 100 {
+        "moderate".to_string() 
+    } else {
+        "simple".to_string()
+    }
 }

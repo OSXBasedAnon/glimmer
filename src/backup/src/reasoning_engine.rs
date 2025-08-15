@@ -11,9 +11,6 @@ pub enum RequestType {
     FunctionCalling,
     Research,
     Reasoning,
-    FileEdit,
-    FileRead,
-    General,
 }
 
 /// Advanced reasoning engine for handling ambiguous requests
@@ -137,6 +134,188 @@ impl ReasoningEngine {
         weights.insert("knowledge_question".to_string(), 0.80);
         weights.insert("greeting".to_string(), 0.75);
         weights
+    }
+
+    /// Intelligent triage using Gemini to determine the best approach
+    pub async fn triage_request(&self, input: &str, context: &str) -> Result<RequestType> {
+        // Generate cache key from normalized input
+        let cache_key = Self::normalize_for_cache(input);
+        
+        // Check cache first - avoid API calls for similar requests
+        if let Ok(cache) = self.triage_cache.lock() {
+            if let Some((cached_type, confidence)) = cache.get(&cache_key) {
+                if *confidence > 0.8 {
+                    return Ok(cached_type.clone());
+                }
+            }
+        }
+        
+        // Smart pattern analysis with weighted scoring
+        let (request_type, confidence) = self.analyze_request_patterns(input, context);
+        
+        if confidence > 0.75 {
+            // Cache high-confidence results
+            if let Ok(mut cache) = self.triage_cache.lock() {
+                cache.insert(cache_key, (request_type.clone(), confidence));
+                // Limit cache size to prevent memory bloat
+                if cache.len() > 1000 {
+                    cache.clear();
+                }
+            }
+            return Ok(request_type);
+        }
+        
+        // Quick pattern matching for obvious operations - avoid expensive AI calls when possible
+        let input_lower = input.to_lowercase();
+
+        // PRIORITY 1: File operations - immediately route to function calling
+        if input_lower.contains("folder")
+            || input_lower.contains("directory")
+            || (input_lower.contains("what")
+                && (input_lower.contains("in the")
+                    || input_lower.contains("in folder")
+                    || input_lower.contains("in directory")))
+            || input_lower.contains("find") && (input_lower.contains("file") || input_lower.contains("."))
+            || input_lower.contains("where is") && input_lower.contains("file")
+            || input_lower.contains("locate") && (input_lower.contains("file") || input_lower.contains("."))
+            || input_lower.contains("search for")
+                && (input_lower.contains("file") || input_lower.contains("."))
+            || input_lower.contains("fix") && input_lower.contains(".")
+            || input_lower.contains("edit") && input_lower.contains(".")
+            || input_lower.contains("modify") && input_lower.contains(".")
+            || input_lower.contains("remove")
+                && (input_lower.contains("from")
+                    || input_lower.contains("in")
+                    || input_lower.contains(".")
+                    || input_lower.contains("debugging"))
+            || input_lower.contains("read") && input_lower.contains(".")
+            || input_lower.contains("can you") && input_lower.contains(".html")
+            || input_lower.contains("for") && input_lower.contains(".")
+        {
+            return Ok(RequestType::FunctionCalling);
+        }
+
+        // Simple greetings - immediate direct answer
+        if matches!(
+            input_lower.trim(),
+            "hi" | "hello" | "hey" | "good morning" | "good evening"
+        ) {
+            return Ok(RequestType::DirectAnswer);
+        }
+
+        // Pure knowledge questions ONLY (not file/folder related)
+        if (input_lower.starts_with("what is")
+            || input_lower.starts_with("who is")
+            || input_lower.starts_with("how to")
+            || input_lower.starts_with("explain"))
+            && !input_lower.contains("folder")
+            && !input_lower.contains("directory")
+            && !input_lower.contains("file")
+            && !input.contains(":\\")
+        {
+            return Ok(RequestType::DirectAnswer);
+        }
+
+        // If we got here, pattern matching didn't match - now use AI triage
+        let prompt = format!(
+            r#"Analyze this user request and determine the best approach to handle it. Choose ONE of these categories:
+
+1. **DirectAnswer**: Simple questions that can be answered immediately with existing knowledge
+2. **FunctionCalling**: Tasks requiring specific actions like file operations, file editing, file searching, or code analysis
+3. **Research**: Complex queries requiring web research or current information
+4. **Reasoning**: Ambiguous requests that need clarification or complex reasoning
+
+Request: "{}"
+Context: {}
+
+Respond with ONLY the category name: DirectAnswer, FunctionCalling, Research, or Reasoning"#,
+            input, context
+        );
+
+        let response = gemini::query_gemini(&prompt, &self.config).await?;
+        let category = response.trim();
+
+        match category {
+            "DirectAnswer" => Ok(RequestType::DirectAnswer),
+            "FunctionCalling" => Ok(RequestType::FunctionCalling),
+            "Research" => Ok(RequestType::Research),
+            "Reasoning" => Ok(RequestType::Reasoning),
+            _ => Ok(RequestType::FunctionCalling), // Default to function calling
+        }
+    }
+    
+    /// Normalize input for caching (remove variations, focus on intent)
+    fn normalize_for_cache(input: &str) -> String {
+        let normalized = input.to_lowercase()
+            .replace("can you", "")
+            .replace("please", "")
+            .replace("could you", "")
+            .trim()
+            .chars()
+            .take(50) // Limit length for cache efficiency
+            .collect::<String>();
+        
+        // Extract key intent words
+        let key_words: Vec<&str> = normalized.split_whitespace()
+            .filter(|word| {
+                !["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with"].contains(word)
+            })
+            .take(5)
+            .collect();
+        
+        key_words.join(" ")
+    }
+    
+    /// Advanced pattern analysis with weighted confidence scoring
+    fn analyze_request_patterns(&self, input: &str, context: &str) -> (RequestType, f32) {
+        let input_lower = input.to_lowercase();
+        let mut scores = std::collections::HashMap::new();
+        
+        // File operation patterns (highest priority)
+        let file_indicators = [
+            "edit", "modify", "change", "update", "fix", "improve", "file", "folder", 
+            "directory", "read", "write", "create", "delete", ".html", ".js", ".css", 
+            ".rs", ".py", ".json", "code", "script"
+        ];
+        let file_score = file_indicators.iter()
+            .filter(|&&indicator| input_lower.contains(indicator))
+            .count() as f32 / file_indicators.len() as f32;
+        scores.insert(RequestType::FunctionCalling, file_score * 0.95);
+        
+        // Knowledge question patterns
+        let knowledge_indicators = [
+            "what is", "who is", "how to", "explain", "define", "meaning", 
+            "difference between", "tell me about"
+        ];
+        let knowledge_score = knowledge_indicators.iter()
+            .filter(|&&indicator| input_lower.contains(indicator))
+            .count() as f32 / knowledge_indicators.len() as f32;
+        scores.insert(RequestType::DirectAnswer, knowledge_score * 0.80);
+        
+        // Research patterns
+        let research_indicators = [
+            "latest", "current", "news", "recent", "today", "now", "2024", "2025"
+        ];
+        let research_score = research_indicators.iter()
+            .filter(|&&indicator| input_lower.contains(indicator))
+            .count() as f32 / research_indicators.len() as f32;
+        scores.insert(RequestType::Research, research_score * 0.85);
+        
+        // Context boosting
+        let context_lower = context.to_lowercase();
+        if context_lower.contains("file") || context_lower.contains(".") {
+            if let Some(score) = scores.get_mut(&RequestType::FunctionCalling) {
+                *score += 0.2;
+            }
+        }
+        
+        // Find highest scoring type
+        let best_match = scores.iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(req_type, score)| (req_type.clone(), *score))
+            .unwrap_or((RequestType::Reasoning, 0.0));
+        
+        best_match
     }
 
     /// Fast parallel reasoning with instant local analysis
@@ -278,13 +457,13 @@ impl ReasoningEngine {
                         "I understand you want to create a new file at '{}' {}. Let me create that for you.",
                         path, description
                     )));
-                }
+                },
                 FileOperationIntent::EditExisting { path, changes } => {
                     return Ok(Some(format!(
                         "I understand you want to edit the existing file '{}' to {}. Let me modify that file.",
                         path, changes
                     )));
-                }
+                },
                 FileOperationIntent::CreateOrEdit { path, description } => {
                     // Check if file exists to decide
                     if std::path::Path::new(&path).exists() {
@@ -437,120 +616,12 @@ impl ReasoningEngine {
         Ok(data.into_iter().take(limit).collect())
     }
 
-    /// Pure AI-based intelligent triage method for accurate request classification
-    pub async fn triage_request(&self, input: &str, conversation_history: &[crate::cli::memory::ChatMessage]) -> Result<RequestType> {
-        // Build context from recent conversation
-        let context = if conversation_history.len() > 1 {
-            conversation_history.iter()
-                .take(5) // Last 5 messages for context
-                .map(|msg| format!("{}: {}", 
-                    match msg.role {
-                        crate::cli::memory::MessageRole::User => "User",
-                        crate::cli::memory::MessageRole::Assistant => "Assistant",
-                        crate::cli::memory::MessageRole::System => "System",
-                    },
-                    msg.content.chars().take(200).collect::<String>() // Truncate for efficiency
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            "No previous context".to_string()
-        };
-
-        // Create intelligent triage prompt for pure AI classification
-        let triage_prompt = format!(
-            r#"You are an expert AI assistant that classifies user requests with perfect accuracy. Your job is to understand the intent and classify appropriately.
-
-USER REQUEST: "{}"
-
-RECENT CONTEXT:
-{}
-
-You must classify this request into exactly ONE of these categories:
-
-1. DirectAnswer - The user wants a direct informational response from AI knowledge
-   Examples: "what is python", "explain machine learning", "how does HTTP work", "define recursion"
-   
-2. Research - The user needs current information or web research
-   Examples: "latest news about AI", "current weather", "recent developments in tech"
-   
-3. FileEdit - The user wants to modify, edit, write, or change files
-   Examples: "edit this file", "modify the code", "write a new script"
-   
-4. FileRead - The user wants to read, view, or examine existing files  
-   Examples: "show me the contents", "read this file", "analyze the code"
-   
-5. FunctionCalling - The user needs complex operations requiring tools/functions
-   Examples: "create a web app", "build a system", "set up a project", "run tests"
-   
-6. Reasoning - The request is ambiguous and needs clarification
-   Examples: vague requests that could mean multiple things
-
-CRITICAL: Analyze the user's TRUE INTENT. A simple knowledge question should be DirectAnswer, NOT FunctionCalling.
-
-Respond with EXACTLY ONE WORD: DirectAnswer, Research, FileEdit, FileRead, FunctionCalling, or Reasoning"#,
-            input, context
-        );
-
-        // Get AI classification - pure AI decision
-        let classification_response = crate::gemini::query_gemini(&triage_prompt, &self.config).await?;
-        
-        // Use AI to parse and understand its own classification response
-        let parse_prompt = format!(
-            r#"I asked an AI to classify a request and it responded: "{}"
-
-The AI was supposed to classify into one of these exact categories:
-- DirectAnswer
-- Research  
-- FileEdit
-- FileRead
-- FunctionCalling
-- Reasoning
-
-What classification did the AI choose? Respond with the EXACT category name only."#,
-            classification_response.trim()
-        );
-        
-        let parsed_response = crate::gemini::query_gemini(&parse_prompt, &self.config).await?;
-        let final_classification = parsed_response.trim();
-        
-        // Convert AI's interpretation to RequestType
-        match final_classification {
-            "DirectAnswer" => Ok(RequestType::DirectAnswer),
-            "Research" => Ok(RequestType::Research),
-            "FileEdit" => Ok(RequestType::FileEdit),
-            "FileRead" => Ok(RequestType::FileRead),
-            "FunctionCalling" => Ok(RequestType::FunctionCalling),
-            "Reasoning" => Ok(RequestType::Reasoning),
-            _ => {
-                // If still unclear, ask AI to make the final decision
-                let final_decision_prompt = format!(
-                    r#"A user asked: "{}"
-
-This is either:
-A) A simple question needing a direct answer (like "what is X", "how does Y work")
-B) A complex task needing tools and functions
-
-Which is it? Respond: A or B"#,
-                    input
-                );
-                
-                let decision = crate::gemini::query_gemini(&final_decision_prompt, &self.config).await?;
-                if decision.trim().starts_with("A") {
-                    Ok(RequestType::DirectAnswer)
-                } else {
-                    Ok(RequestType::FunctionCalling)
-                }
-            }
-        }
-    }
-
     /// Analyze if I'm capable of handling this request based on available functions
     pub async fn assess_my_capabilities(&self, request: &str, available_functions: &[String]) -> Result<CapabilityAssessment> {
         let functions_list = available_functions.join(", ");
         
         let prompt = format!(
-            r##"I am an AI assistant trying to determine if I can handle a user request.
+            r#"I am an AI assistant trying to determine if I can handle a user request.
 
 USER REQUEST: {}
 
@@ -571,7 +642,7 @@ Respond in JSON format:
     "reasoning": "why I think I can or cannot do this",
     "suggested_approach": "what I should try first",
     "experimental": true/false (if this requires creative function combination)
-}}"##,
+}}"#,
             request, functions_list
         );
 
@@ -675,7 +746,20 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about domain criteria...");
         
         let prompt = format!(
-            "The user wants to evaluate domains with this request: '{}'\n\nContext: {}\n\nGenerate specific, actionable criteria for evaluating domains. Consider:\n\n- Business value and brandability\n- Technical factors (length, TLD, etc.)\n- Market considerations\n- User intent and industry\n\nProvide a JSON response with:\n{{\n    \"interpretation\": \"What the user likely wants\",\n    \"criteria\": [\"criterion1\", \"criterion2\", ...],\n    \"questions\": [\"clarifying question1\", ...],\n    \"confidence\": 0.8\n}}",
+            "The user wants to evaluate domains with this request: '{}'\n\
+            Context: {}\n\n\
+            Generate specific, actionable criteria for evaluating domains. Consider:\n\
+            - Business value and brandability\n\
+            - Technical factors (length, TLD, etc.)\n\
+            - Market considerations\n\
+            - User intent and industry\n\n\
+            Provide a JSON response with:\n\
+            {{\n\
+                \"interpretation\": \"What the user likely wants\",\n\
+                \"criteria\": [\"criterion1\", \"criterion2\", ...],\n\
+                \"questions\": [\"clarifying question1\", ...],\n\
+                \"confidence\": 0.8\n\
+            }}",
             request, context
         );
 
@@ -702,7 +786,15 @@ Respond in JSON format:
         if suggested_improvements.is_empty() {
             // Fallback to AI reasoning
             let prompt = format!(
-                "The user wants to improve code with this request: '{}'\n\nContext: {}\n\nWhat specific improvements should be made? Consider:\n\n- Performance optimizations\n- Code readability and maintainability\n- Error handling and robustness\n- Modern best practices\n- Security considerations\n\nProvide specific, actionable improvement suggestions.",
+                "The user wants to improve code with this request: '{}'\n\
+                Context: {}\n\n\
+                What specific improvements should be made? Consider:\n\
+                - Performance optimizations\n\
+                - Code readability and maintainability\n\
+                - Error handling and robustness\n\
+                - Modern best practices\n\
+                - Security considerations\n\n\
+                Provide specific, actionable improvement suggestions.",
                 request, context
             );
 
@@ -716,7 +808,7 @@ Respond in JSON format:
 
         Ok(ReasoningResult {
             interpretation: format!("Code improvement request focusing on: {}", 
-                matching_patterns.iter() 
+                matching_patterns.iter()
                     .map(|p| p.description.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")),
@@ -744,7 +836,14 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about selection criteria...");
 
         let prompt = format!(
-            "The user wants to select/filter items with: '{}'\n\nContext: {}\n\nWhat are the most logical selection criteria? Consider:\n\n- Quality indicators\n- Relevance factors\n- User preferences\n- Practical constraints\n\nProvide specific, measurable criteria for selection.",
+            "The user wants to select/filter items with: '{}'\n\
+            Context: {}\n\n\
+            What are the most logical selection criteria? Consider:\n\
+            - Quality indicators\n\
+            - Relevance factors\n\
+            - User preferences\n\
+            - Practical constraints\n\n\
+            Provide specific, measurable criteria for selection.",
             request, context
         );
 
@@ -759,7 +858,14 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about analysis approach...");
 
         let prompt = format!(
-            "The user wants analysis with: '{}'\n\nContext: {}\n\nWhat should be analyzed and how? Consider:\n\n- Key metrics and indicators\n- Comparative analysis\n- Trends and patterns\n- Actionable insights\n\nProvide a structured analysis approach.",
+            "The user wants analysis with: '{}'\n\
+            Context: {}\n\n\
+            What should be analyzed and how? Consider:\n\
+            - Key metrics and indicators\n\
+            - Comparative analysis\n\
+            - Trends and patterns\n\
+            - Actionable insights\n\n\
+            Provide a structured analysis approach.",
             request, context
         );
 
@@ -774,7 +880,14 @@ Respond in JSON format:
         // Example: PersistentStatusBar::update_status("Reasoning about ambiguous request...");
 
         let prompt = format!(
-            "The user made this ambiguous request: '{}'\n\nContext: {}\n\nHelp clarify what they might want by:\n1. Interpreting the most likely intent\n2. Suggesting specific criteria or parameters\n3. Asking clarifying questions\n4. Providing an actionable plan\n\nBe specific and helpful in your suggestions.",
+            "The user made this ambiguous request: '{}'\n\
+            Context: {}\n\n\
+            Help clarify what they might want by:\n\
+            1. Interpreting the most likely intent\n\
+            2. Suggesting specific criteria or parameters\n\
+            3. Asking clarifying questions\n\
+            4. Providing an actionable plan\n\n\
+            Be specific and helpful in your suggestions.",
             request, context
         );
 
@@ -793,7 +906,7 @@ Respond in JSON format:
 
             let criteria = json_value.get("criteria")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter() 
+                .map(|arr| arr.iter()
                     .filter_map(|v| v.as_str())
                     .map(|s| s.to_string())
                     .collect())
@@ -854,11 +967,8 @@ Respond in JSON format:
     pub fn present_reasoning(&self, reasoning: &ReasoningResult) -> String {
         let mut output = String::new();
         
-        output.push_str(&format!("{}🧠 **Reasoning Analysis**{}
-", EMERALD_BRIGHT, RESET));
-        output.push_str(&format!("**Interpretation**: {}
-
-", reasoning.interpretation));
+        output.push_str(&format!("{}🧠 **Reasoning Analysis**{}\n", EMERALD_BRIGHT, RESET));
+        output.push_str(&format!("**Interpretation**: {}\n\n", reasoning.interpretation));
         
         if !reasoning.suggested_criteria.is_empty() {
             output.push_str("**Suggested Criteria**:\n");
@@ -871,7 +981,7 @@ Respond in JSON format:
         if !reasoning.clarification_questions.is_empty() {
             output.push_str("**Clarifying Questions**:\n");
             for question in &reasoning.clarification_questions {
-                output.push_str(&format!("{}{}{}\n", GRAY_DIM, question, RESET));
+                output.push_str(&format!("{}• {}{}\n", GRAY_DIM, question, RESET));
             }
             output.push('\n');
         }
@@ -1067,7 +1177,7 @@ impl EditFailureReasoning {
     /// Analyze an edit failure using an LLM for more generic and powerful reasoning.
     pub async fn analyze(request: &str, current_content: &str, user_feedback: &str, config: &Config) -> Result<Self> {
         let prompt = format!(
-            r##"An AI code editing task failed. Analyze the situation to determine the cause and recommend a new approach.
+            r#"An AI code editing task failed. Analyze the situation to determine the cause and recommend a new approach.
 
             **Original User Request:**
             "{}"
@@ -1092,7 +1202,7 @@ impl EditFailureReasoning {
                 "likely_problem": "...",
                 "recommended_approach": "...",
                 "user_frustration_level": 8
-            }}"##,
+            }}"#,
             request, user_feedback, current_content.chars().take(2000).collect::<String>()
         );
 
