@@ -19,6 +19,7 @@
 * **Transparent "Chain-of-Thought" Output:** Glimmer provides a detailed "thinking" trace for all multi-step tasks. This output documents the AI's internal reasoning process, showcasing each sub-step and the corresponding partial results, which is instrumental for debugging and building trust in the system's decisions.
 
 * **Rust-Powered Performance:** By leveraging Rust's ownership model, zero-cost abstractions, and robust concurrency primitives (`tokio`, `rayon`), Glimmer achieves exceptional speed and memory safety. Dependencies such as `clap` for argument parsing and `reqwest` for asynchronous HTTP requests are carefully selected to ensure a performant and reliable architecture.
+<img width="1112" height="548" alt="Screenshot 2025-08-15 002307" src="https://github.com/user-attachments/assets/1913b3be-1238-4189-a6b9-8f8d6699227e" />
 
 ---
 
@@ -112,6 +113,7 @@ Options:
   -v, --verbose           Enables verbose logging via the tracing crate.
   -c, --config <FILE>     Specifies an alternative path to the configuration file.
   -h, --help              Print help
+
 
 
 
